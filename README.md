@@ -1,4 +1,4 @@
-# NewVUE
+# GrrrphUE
 # Project brief
 
 Build a future-hardened, open-source functional successor to VUE based on the public `rpavlik/VUE` `2025` branch, but preserve functionality rather than implementation.
