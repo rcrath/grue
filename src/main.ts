@@ -1,0 +1,276 @@
+import "./style.css";
+import { Editor, Tool } from "./ui/editor";
+import { NODE_SHAPES, NodeShape, docFromJson, docToJson, newDoc } from "./core/model";
+import { exportVue, importVue } from "./core/vueFormat";
+import { baseName, isTauri, openFile, saveFileAs, saveFileTo } from "./ui/platform";
+
+const app = document.getElementById("app")!;
+app.innerHTML = `
+  <div id="toolbar">
+    <div class="tool-group" id="tools"></div>
+    <div class="sep"></div>
+    <div class="tool-group" id="file-ops"></div>
+    <div class="sep"></div>
+    <div class="tool-group" id="edit-ops"></div>
+    <div class="sep"></div>
+    <div class="tool-group" id="style-ops">
+      <select id="shape-pick" title="Node shape"></select>
+      <label class="swatch" title="Fill color"><input type="color" id="fill-pick" value="#F2AE45"><span>fill</span></label>
+      <label class="swatch" title="Line color"><input type="color" id="stroke-pick" value="#776D6D"><span>line</span></label>
+      <label class="swatch" title="Text color"><input type="color" id="text-pick" value="#000000"><span>text</span></label>
+      <button id="arrow-cycle" title="Cycle arrowheads on selected links">arrows</button>
+      <select id="curve-pick" title="Link curve">
+        <option value="0">straight</option>
+        <option value="1">curved</option>
+        <option value="2">s-curve</option>
+      </select>
+    </div>
+    <div class="sep"></div>
+    <div class="tool-group" id="view-ops"></div>
+  </div>
+  <div id="canvas"></div>
+  <div id="statusbar"><span id="status-file">untitled</span><span id="status-hint"></span><span id="status-zoom">100%</span></div>
+`;
+
+const editor = new Editor(document.getElementById("canvas")!);
+
+let currentPath: string | null = null;
+let currentName = "untitled.grue";
+
+// ---------- toolbar ----------
+
+function button(parent: HTMLElement, label: string, title: string, onClick: () => void): HTMLButtonElement {
+  const b = document.createElement("button");
+  b.textContent = label;
+  b.title = title;
+  b.addEventListener("click", () => {
+    onClick();
+    b.blur();
+  });
+  parent.appendChild(b);
+  return b;
+}
+
+const toolsDiv = document.getElementById("tools")!;
+const toolButtons = new Map<Tool, HTMLButtonElement>();
+const toolDefs: [Tool, string, string][] = [
+  ["select", "select", "Selection tool (s)"],
+  ["node", "node", "Node tool (n): click or drag to create"],
+  ["link", "link", "Link tool (l): drag from node to node"],
+  ["hand", "pan", "Pan tool (m), or hold Space"],
+];
+for (const [t, label, title] of toolDefs) {
+  toolButtons.set(t, button(toolsDiv, label, title, () => editor.setTool(t)));
+}
+
+const fileDiv = document.getElementById("file-ops")!;
+button(fileDiv, "new", "New map", () => newMap());
+button(fileDiv, "open", "Open .grue or .vue (Ctrl+O)", () => doOpen());
+button(fileDiv, "save", "Save (Ctrl+S)", () => doSave());
+button(fileDiv, "save as", "Save As (Ctrl+Shift+S)", () => doSaveAs());
+button(fileDiv, "export .vue", "Export as legacy VUE map", () => doExportVue());
+
+const editDiv = document.getElementById("edit-ops")!;
+const undoBtn = button(editDiv, "undo", "Undo (Ctrl+Z)", () => editor.undo());
+const redoBtn = button(editDiv, "redo", "Redo (Ctrl+Shift+Z)", () => editor.redo());
+button(editDiv, "delete", "Delete selection (Del)", () => editor.deleteSelection());
+
+const viewDiv = document.getElementById("view-ops")!;
+button(viewDiv, "−", "Zoom out (Ctrl+-)", () => editor.zoomStep(-1));
+button(viewDiv, "+", "Zoom in (Ctrl+=)", () => editor.zoomStep(1));
+button(viewDiv, "fit", "Zoom to fit (Ctrl+])", () => editor.zoomFit());
+button(viewDiv, "100%", "Actual size (Ctrl+')", () => editor.zoomActual());
+
+// style controls
+const shapePick = document.getElementById("shape-pick") as HTMLSelectElement;
+for (const s of NODE_SHAPES) {
+  const o = document.createElement("option");
+  o.value = s;
+  o.textContent = s === "roundRect" ? "rounded" : s === "rect" ? "rectangle" : s === "ellipse" ? "oval" : s;
+  shapePick.appendChild(o);
+}
+shapePick.addEventListener("change", () => {
+  const shape = shapePick.value as NodeShape;
+  editor.defaultShape = shape;
+  editor.applyStyleToSelection({ shape });
+});
+
+(document.getElementById("fill-pick") as HTMLInputElement).addEventListener("input", (e) => {
+  editor.applyStyleToSelection({ fill: (e.target as HTMLInputElement).value });
+});
+(document.getElementById("stroke-pick") as HTMLInputElement).addEventListener("input", (e) => {
+  editor.applyStyleToSelection({ stroke: (e.target as HTMLInputElement).value });
+});
+(document.getElementById("text-pick") as HTMLInputElement).addEventListener("input", (e) => {
+  editor.applyStyleToSelection({ textColor: (e.target as HTMLInputElement).value });
+});
+document.getElementById("arrow-cycle")!.addEventListener("click", () => {
+  // cycle NONE -> HEAD -> TAIL -> BOTH like legacy VUE
+  const sel = [...editor.selection];
+  const firstLink = editor.doc.items.find((i) => sel.includes(i.id) && i.kind === "link");
+  const next = firstLink && firstLink.kind === "link" ? (firstLink.arrowState + 1) % 4 : 2;
+  editor.applyStyleToSelection({ arrowState: next });
+});
+(document.getElementById("curve-pick") as HTMLSelectElement).addEventListener("change", (e) => {
+  editor.applyStyleToSelection({ controlCount: parseInt((e.target as HTMLSelectElement).value, 10) as 0 | 1 | 2 });
+});
+
+// ---------- status / title ----------
+
+const statusFile = document.getElementById("status-file")!;
+const statusHint = document.getElementById("status-hint")!;
+const statusZoom = document.getElementById("status-zoom")!;
+
+function refreshChrome(): void {
+  statusFile.textContent = currentName + (editor.dirty ? " •" : "");
+  document.title = `${currentName}${editor.dirty ? " •" : ""} — GrrrphUE`;
+  statusZoom.textContent = `${Math.round(editor.zoom * 100)}%`;
+  undoBtn.disabled = !editor.canUndo();
+  redoBtn.disabled = !editor.canRedo();
+  for (const [t, b] of toolButtons) b.classList.toggle("active", editor.tool === t);
+  statusHint.textContent =
+    editor.tool === "node" ? "click or drag on the canvas to create a node"
+    : editor.tool === "link" ? "drag from one node to another to connect them"
+    : editor.tool === "hand" ? "drag to pan"
+    : "";
+}
+
+editor.onChange = refreshChrome;
+editor.onViewChange = refreshChrome;
+refreshChrome();
+
+// ---------- file operations ----------
+
+function confirmDiscard(): boolean {
+  if (!editor.dirty) return true;
+  return window.confirm("You have unsaved changes. Discard them?");
+}
+
+function newMap(): void {
+  if (!confirmDiscard()) return;
+  currentPath = null;
+  currentName = "untitled.grue";
+  editor.setDoc(newDoc());
+  refreshChrome();
+}
+
+async function doOpen(): Promise<void> {
+  if (!confirmDiscard()) return;
+  const f = await openFile();
+  if (!f) return;
+  try {
+    if (f.name.toLowerCase().endsWith(".vue")) {
+      const { doc, warnings } = importVue(f.text);
+      editor.setDoc(doc);
+      editor.zoomFit();
+      currentPath = null; // imported: force Save As so we don't overwrite the .vue
+      currentName = f.name.replace(/\.vue$/i, ".grue");
+      editor.dirty = true;
+      if (warnings.length) console.warn("VUE import warnings:", warnings);
+    } else {
+      editor.setDoc(docFromJson(f.text));
+      currentPath = f.path;
+      currentName = f.name;
+    }
+  } catch (err) {
+    alert(`Could not open ${f.name}:\n${err instanceof Error ? err.message : err}`);
+  }
+  refreshChrome();
+}
+
+async function doSave(): Promise<void> {
+  if (!currentPath) return doSaveAs();
+  editor.prepareForSave();
+  await saveFileTo(currentPath, docToJson(editor.doc));
+  editor.markSaved();
+  refreshChrome();
+}
+
+async function doSaveAs(): Promise<void> {
+  editor.prepareForSave();
+  const path = await saveFileAs(currentName, docToJson(editor.doc));
+  if (!path) return;
+  if (isTauri()) {
+    currentPath = path;
+    currentName = baseName(path);
+  }
+  editor.markSaved();
+  refreshChrome();
+}
+
+async function doExportVue(): Promise<void> {
+  editor.prepareForSave();
+  const name = currentName.replace(/\.grue$/i, "") + ".vue";
+  await saveFileAs(name, exportVue(editor.doc, name));
+}
+
+// ---------- global shortcuts ----------
+
+window.addEventListener("keydown", (e) => {
+  const cmd = e.ctrlKey || e.metaKey;
+  if (!cmd) return;
+  switch (e.key.toLowerCase()) {
+    case "o":
+      e.preventDefault();
+      doOpen();
+      break;
+    case "s":
+      e.preventDefault();
+      if (e.shiftKey) doSaveAs();
+      else doSave();
+      break;
+    case "n":
+      // Ctrl+N: new node at the pointer (legacy VUE), not new window
+      e.preventDefault();
+      editor.createNodeAt(...lastCanvasPoint());
+      break;
+  }
+});
+
+let lastMouse: [number, number] = [innerWidth / 2, innerHeight / 2];
+window.addEventListener("pointermove", (e) => (lastMouse = [e.clientX, e.clientY]));
+function lastCanvasPoint(): [number, number] {
+  const w = editor.screenToWorld(lastMouse[0], lastMouse[1]);
+  return [w.x, w.y];
+}
+
+// drag & drop a map file onto the window
+window.addEventListener("dragover", (e) => e.preventDefault());
+window.addEventListener("drop", async (e) => {
+  e.preventDefault();
+  const f = e.dataTransfer?.files?.[0];
+  if (!f) return;
+  if (!confirmDiscard()) return;
+  const text = await f.text();
+  try {
+    if (f.name.toLowerCase().endsWith(".vue")) {
+      const { doc, warnings } = importVue(text);
+      editor.setDoc(doc);
+      editor.zoomFit();
+      currentPath = null;
+      currentName = f.name.replace(/\.vue$/i, ".grue");
+      editor.dirty = true;
+      if (warnings.length) console.warn("VUE import warnings:", warnings);
+    } else {
+      editor.setDoc(docFromJson(text));
+      currentPath = null;
+      currentName = f.name;
+    }
+  } catch (err) {
+    alert(`Could not open ${f.name}:\n${err instanceof Error ? err.message : err}`);
+  }
+  refreshChrome();
+});
+
+window.addEventListener("beforeunload", (e) => {
+  if (editor.dirty) e.preventDefault();
+});
+
+// debug/automation hook (also used by smoke tests)
+(window as unknown as Record<string, unknown>).__grrrphue = {
+  editor,
+  importVue,
+  exportVue,
+  docToJson,
+  docFromJson,
+};

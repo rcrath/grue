@@ -1,0 +1,20 @@
+{
+  "name": "grrrphue",
+  "version": "0.1.0",
+  "description": "GrrrphUE — visual knowledge-mapping application, functional successor to Tufts VUE",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/api": "^2.2.0",
+    "@tauri-apps/cli": "^2.2.0",
+    "@tauri-apps/plugin-dialog": "^2.2.0",
+    "@tauri-apps/plugin-fs": "^2.2.0",
+    "typescript": "^5.6.3",
+    "vite": "^6.0.5"
+  }
+}

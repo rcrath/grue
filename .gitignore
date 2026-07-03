@@ -1,1 +1,6 @@
 vue_mcp_2025.zip
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/schemas/
+*.log

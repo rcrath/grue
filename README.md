@@ -52,6 +52,30 @@ Do not reuse bundled legacy jars or distribution logic from VUE as authoritative
 6. Add desktop packaging in Tauri.
 7. Add mobile targets later from shared core.
 
+## Current state (2026-07-02)
+
+Nodes-and-edges MVP implemented (delivery plan steps 1, 2, and the node/link part of 5):
+
+- Tauri 2 + Vite + TypeScript, no UI framework; SVG rendering.
+- Node/link editing: select, node, link, and pan tools (keys s/n/l/m, hold Space to pan);
+  drag-out or click node creation; drag node-to-node link creation with target highlight,
+  tail arrowhead, auto-curve for parallel links; marquee and shift-click selection;
+  move, resize handles, link endpoint re-attach, curve control points; inline label
+  editing (double-click); delete; duplicate; nudge; undo/redo; zoom presets, wheel
+  zoom/pan, fit, 100%.
+- Legacy defaults preserved: node fill #F2AE45, stroke #776D6D, round-rect arc 20,
+  link #404040 with tail arrow, selection chrome #4A95FF.
+- Native format `.grue` (JSON, docs/schema.md). Legacy `.vue` import (nodes, links,
+  curves, colors, fonts, labels, layers, groups flattened; images skipped) and minimal
+  `.vue` export, verified round-trip on real maps.
+- Extracted legacy behavior specs live in docs/legacy-specs/.
+
+Build (Windows): `npm install`, then `npx tauri build`.
+Artifacts: portable exe at `src-tauri/target/release/grrrphue.exe`,
+installer at `src-tauri/target/release/bundle/nsis/`.
+Dev: `npm run tauri dev` (desktop) or `npm run dev` (browser, file dialogs fall back
+to download/upload).
+
 ## How to work in this repo
 
 - Read this file first on every session.
