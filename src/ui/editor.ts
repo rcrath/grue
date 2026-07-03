@@ -2,9 +2,10 @@
 // Interaction model follows legacy VUE (docs/legacy-specs/interaction.md).
 
 import {
-  GDoc, GItem, GLink, GNode, LinkEnd, NodeShape, STROKE_DASHES,
-  SELECTION_COLOR, deleteItems, docBounds, getNode, hasStraightLinkBetween,
-  makeLink, makeNode, newDoc, allocId,
+  FONT_SIZES, GDoc, GFont, GItem, GLink, GNode, GResource, LinkEnd, NodeShape,
+  STROKE_DASHES, SELECTION_COLOR, deleteItems, docBounds, expandToGroups, getNode,
+  groupItems, hasStraightLinkBetween, isItemSelectable, isItemVisible, makeLink,
+  makeNode, newDoc, allocId, paintOrder, ungroupItems,
 } from "../core/model";
 import {
   Pt, distSqToSegment, flattenLinkPath, linkMidpoint, nodeCenter, nodeOutline,
@@ -13,7 +14,27 @@ import {
 import { History } from "../core/history";
 import { autoSizeFor, fontToCss, measureLabel } from "./measure";
 
-export type Tool = "select" | "node" | "link" | "hand";
+export type Tool = "select" | "node" | "link" | "hand" | "combo" | "zoom";
+
+/** Style snapshot for Copy Style / Paste Style (ui-spec §5). Kind-matched on paste;
+ *  held in memory only, never persisted. */
+export type StyleSnapshot =
+  | { kind: "node"; shape: NodeShape; fill: string | null; stroke: string; strokeWidth: number; strokeStyle: number; textColor: string; font: GFont }
+  | { kind: "link"; stroke: string; strokeWidth: number; strokeStyle: number; textColor: string; font: GFont; arrowState: number; controlCount: 0 | 1 | 2 };
+
+export type AlignMode = "top" | "bottom" | "left" | "right" | "rowCenter" | "colCenter";
+
+/** Style patch applied to every selected item of the matching kind. */
+export interface StylePatch {
+  shape?: NodeShape;
+  fill?: string | null;
+  stroke?: string;
+  strokeWidth?: number;
+  strokeStyle?: number;
+  textColor?: string;
+  arrowState?: number;
+  controlCount?: 0 | 1 | 2;
+}
 
 const ZOOM_PRESETS = [
   1 / 64, 1 / 32, 1 / 16, 1 / 8, 1 / 4, 1 / 2, 0.75, 1, 1.25, 1.5, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 128,
@@ -28,7 +49,8 @@ type Drag =
   | { kind: "move"; startW: Pt; orig: Map<string, { x: number; y: number }>; origLinks: Map<string, GLink>; moved: boolean }
   | { kind: "marquee"; startW: Pt; curW: Pt; toggle: boolean }
   | { kind: "nodeRect"; startW: Pt; curW: Pt; started: boolean }
-  | { kind: "linkDraw"; sourceId: string; curW: Pt; targetId: string | null; startS: Pt }
+  | { kind: "linkDraw"; sourceId: string; curW: Pt; targetId: string | null; startS: Pt; combo: boolean }
+  | { kind: "zoomRect"; startW: Pt; curW: Pt; started: boolean; out: boolean; startS: Pt }
   | { kind: "pan"; startS: Pt; origPan: Pt }
   | { kind: "resize"; nodeId: string; handle: number; orig: { x: number; y: number; w: number; h: number }; moved: boolean }
   | { kind: "endpoint"; linkId: string; end: "head" | "tail"; curW: Pt; targetId: string | null; moved: boolean }
@@ -46,9 +68,15 @@ export class Editor {
 
   private history = new History();
   private drag: Drag = { kind: "none" };
-  private spaceDown = false;
+  private holdKey: string | null = null; // hold-down temporary tool key
+  private holdTool: Tool | null = null;
   private editingId: string | null = null;
   private labelBox: HTMLTextAreaElement | null = null;
+  private clipboard: { items: GItem[]; groups: string[][] } | null = null;
+  private pasteBump = 0;
+  private styleBuffer: StyleSnapshot | null = null;
+  private savedSelection: Set<string> = new Set(); // for Reselect
+  private expandStack: Set<string>[] = []; // for Expand/Shrink Selection
 
   private svg: SVGSVGElement;
   private world: SVGGElement;
@@ -58,6 +86,8 @@ export class Editor {
 
   onChange: () => void = () => {};
   onViewChange: () => void = () => {};
+  /** Fires after every render (selection, style, or doc may have changed). */
+  onRender: () => void = () => {};
 
   constructor(container: HTMLElement) {
     this.container = container;
@@ -164,14 +194,15 @@ export class Editor {
   }
 
   private effectiveTool(): Tool {
-    return this.spaceDown ? "hand" : this.tool;
+    return this.holdTool ?? this.tool;
   }
 
   private updateCursor(): void {
     const t = this.effectiveTool();
     this.svg.style.cursor =
       t === "hand" ? (this.drag.kind === "pan" ? "grabbing" : "grab")
-      : t === "node" || t === "link" ? "crosshair"
+      : t === "node" || t === "link" || t === "combo" ? "crosshair"
+      : t === "zoom" ? "zoom-in"
       : "default";
   }
 
@@ -198,12 +229,15 @@ export class Editor {
     this.onViewChange();
   }
 
-  zoomStep(dir: 1 | -1): void {
+  zoomStep(dir: 1 | -1, anchorScreen?: Pt): void {
     let next: number;
     if (dir > 0) next = ZOOM_PRESETS.find((p) => p > this.zoom + 1e-9) ?? ZOOM_PRESETS[ZOOM_PRESETS.length - 1];
     else next = [...ZOOM_PRESETS].reverse().find((p) => p < this.zoom - 1e-9) ?? ZOOM_PRESETS[0];
-    this.setZoom(next);
+    this.setZoom(next, anchorScreen);
   }
+
+  atMaxZoom(): boolean { return this.zoom >= ZOOM_PRESETS[ZOOM_PRESETS.length - 1] - 1e-9; }
+  atMinZoom(): boolean { return this.zoom <= ZOOM_PRESETS[0] + 1e-9; }
 
   zoomFit(): void {
     const b = docBounds(this.doc);
@@ -221,6 +255,46 @@ export class Editor {
     this.setZoom(1);
   }
 
+  /** Fit the given map-coordinate rect into the viewport (zoom tool drag, zoom-to-selection). */
+  zoomToRect(b: { x: number; y: number; w: number; h: number }): void {
+    const r = this.svg.getBoundingClientRect();
+    if (r.width < 10) return;
+    const z = Math.min((r.width - FIT_PAD * 2) / Math.max(b.w, 1), (r.height - FIT_PAD * 2) / Math.max(b.h, 1));
+    this.zoom = Math.max(0.001, Math.min(128, z));
+    this.panX = (r.width - b.w * this.zoom) / 2 - b.x * this.zoom;
+    this.panY = (r.height - b.h * this.zoom) / 2 - b.y * this.zoom;
+    this.render();
+    this.onViewChange();
+  }
+
+  zoomToSelection(): void {
+    const b = this.selectionBounds();
+    if (b) this.zoomToRect(b);
+  }
+
+  selectionBounds(): { x: number; y: number; w: number; h: number } | null {
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    const grow = (x: number, y: number) => {
+      if (x < minX) minX = x;
+      if (y < minY) minY = y;
+      if (x > maxX) maxX = x;
+      if (y > maxY) maxY = y;
+    };
+    for (const it of this.selectedItems()) {
+      if (it.kind === "node") {
+        grow(it.x, it.y);
+        grow(it.x + it.w, it.y + it.h);
+      } else {
+        grow(it.head.x, it.head.y);
+        grow(it.tail.x, it.tail.y);
+        if (it.ctrl0) grow(it.ctrl0.x, it.ctrl0.y);
+        if (it.ctrl1) grow(it.ctrl1.x, it.ctrl1.y);
+      }
+    }
+    if (minX === Infinity) return null;
+    return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+  }
+
   // ---------- editing operations ----------
 
   deleteSelection(): void {
@@ -231,14 +305,393 @@ export class Editor {
     this.render();
   }
 
+  selectedItems(): GItem[] {
+    return this.doc.items.filter((i) => this.selection.has(i.id));
+  }
+
+  selectedNodes(): GNode[] {
+    return this.selectedItems().filter((i): i is GNode => i.kind === "node");
+  }
+
+  selectedLinks(): GLink[] {
+    return this.selectedItems().filter((i): i is GLink => i.kind === "link");
+  }
+
   selectAll(): void {
-    for (const it of this.doc.items) this.selection.add(it.id);
+    for (const it of this.doc.items) {
+      if (isItemSelectable(this.doc, it)) this.selection.add(it.id);
+    }
+    this.render();
+  }
+
+  selectAllNodes(): void {
+    this.selection.clear();
+    for (const it of this.doc.items) {
+      if (it.kind === "node" && isItemSelectable(this.doc, it)) this.selection.add(it.id);
+    }
+    this.render();
+  }
+
+  selectAllLinks(): void {
+    this.selection.clear();
+    for (const it of this.doc.items) {
+      if (it.kind === "link" && isItemSelectable(this.doc, it)) this.selection.add(it.id);
+    }
     this.render();
   }
 
   deselectAll(): void {
+    if (this.selection.size) this.savedSelection = new Set(this.selection);
     this.selection.clear();
     this.render();
+  }
+
+  /** Restore the selection recorded by the last deselect. */
+  reselect(): void {
+    const ids = new Set(this.doc.items.map((i) => i.id));
+    const restore = [...this.savedSelection].filter((id) => ids.has(id));
+    if (!restore.length) return;
+    this.selection = new Set(restore);
+    this.render();
+  }
+
+  canReselect(): boolean {
+    return this.savedSelection.size > 0;
+  }
+
+  /** Grow the selection along links: selected nodes pull in their links,
+   *  selected links pull in their endpoint nodes. */
+  expandSelection(): void {
+    if (this.selection.size === 0) return;
+    this.expandStack.push(new Set(this.selection));
+    const add = new Set<string>();
+    for (const it of this.doc.items) {
+      if (it.kind !== "link") continue;
+      if (this.selection.has(it.id)) {
+        if (it.head.node) add.add(it.head.node);
+        if (it.tail.node) add.add(it.tail.node);
+      } else if (
+        (it.head.node && this.selection.has(it.head.node)) ||
+        (it.tail.node && this.selection.has(it.tail.node))
+      ) {
+        add.add(it.id);
+      }
+    }
+    for (const id of add) {
+      const it = this.doc.items.find((i) => i.id === id);
+      if (it && isItemSelectable(this.doc, it)) this.selection.add(id);
+    }
+    this.selection = expandToGroups(this.doc, this.selection);
+    this.render();
+  }
+
+  /** Step back to the selection recorded before the last Expand Selection. */
+  shrinkSelection(): void {
+    const prev = this.expandStack.pop();
+    if (!prev) return;
+    // only meaningful while the expanded selection is still current-ish
+    const valid = new Set([...prev].filter((id) => this.doc.items.some((i) => i.id === id)));
+    this.selection = valid;
+    this.render();
+  }
+
+  canShrinkSelection(): boolean {
+    return this.expandStack.length > 0;
+  }
+
+  // ---------- clipboard (in-memory, app-local) ----------
+
+  copySelection(): void {
+    const items = this.selectedItems().map((i) => structuredClone(i));
+    if (!items.length) return;
+    const groups = this.doc.groups
+      .filter((g) => g.members.every((m) => this.selection.has(m)))
+      .map((g) => [...g.members]);
+    this.clipboard = { items, groups };
+    this.pasteBump = 0;
+  }
+
+  cutSelection(): void {
+    if (this.selection.size === 0) return;
+    this.copySelection();
+    this.deleteSelection();
+  }
+
+  canPaste(): boolean {
+    return this.clipboard != null && this.clipboard.items.length > 0;
+  }
+
+  paste(): void {
+    if (!this.clipboard) return;
+    const src = this.clipboard;
+    const off = 10 * ++this.pasteBump;
+    const layerIds = new Set(this.doc.layers.map((l) => l.id));
+    this.mutate(() => {
+      const idMap = new Map<string, string>();
+      const clones: GItem[] = [];
+      for (const it of src.items) {
+        const clone = structuredClone(it);
+        idMap.set(clone.id, (clone.id = allocId(this.doc)));
+        if (!layerIds.has(clone.layer)) clone.layer = this.doc.activeLayer;
+        if (clone.kind === "node") {
+          clone.x += off;
+          clone.y += off;
+        } else {
+          clone.head = { ...clone.head, x: clone.head.x + off, y: clone.head.y + off };
+          clone.tail = { ...clone.tail, x: clone.tail.x + off, y: clone.tail.y + off };
+          if (clone.ctrl0) clone.ctrl0 = { x: clone.ctrl0.x + off, y: clone.ctrl0.y + off };
+          if (clone.ctrl1) clone.ctrl1 = { x: clone.ctrl1.x + off, y: clone.ctrl1.y + off };
+        }
+        clones.push(clone);
+      }
+      for (const c of clones) {
+        if (c.kind !== "link") continue;
+        c.head.node = c.head.node ? idMap.get(c.head.node) ?? null : null;
+        c.tail.node = c.tail.node ? idMap.get(c.tail.node) ?? null : null;
+      }
+      this.doc.items.push(...clones);
+      for (const members of src.groups) {
+        const mapped = members.map((m) => idMap.get(m)).filter((m): m is string => m != null);
+        groupItems(this.doc, mapped);
+      }
+      this.selection = new Set(clones.map((c) => c.id));
+    });
+  }
+
+  // ---------- groups ----------
+
+  canGroup(): boolean {
+    return this.selection.size >= 2;
+  }
+
+  groupSelection(): void {
+    if (!this.canGroup()) return;
+    this.mutate(() => groupItems(this.doc, [...this.selection]));
+  }
+
+  selectionHasGroup(): boolean {
+    return this.doc.groups.some((g) => g.members.some((m) => this.selection.has(m)));
+  }
+
+  ungroupSelection(): void {
+    if (!this.selectionHasGroup()) return;
+    this.mutate(() => ungroupItems(this.doc, this.selection));
+  }
+
+  /** True when the selection is exactly the member set of one group. */
+  selectionIsGroup(): boolean {
+    return this.doc.groups.some(
+      (g) => g.members.length === this.selection.size && g.members.every((m) => this.selection.has(m)),
+    );
+  }
+
+  // ---------- align ----------
+
+  alignSelection(mode: AlignMode): void {
+    const nodes = this.selectedNodes();
+    if (nodes.length < 2) return;
+    let left = Infinity, top = Infinity, right = -Infinity, bottom = -Infinity, cx = 0, cy = 0;
+    for (const n of nodes) {
+      left = Math.min(left, n.x);
+      top = Math.min(top, n.y);
+      right = Math.max(right, n.x + n.w);
+      bottom = Math.max(bottom, n.y + n.h);
+      cx += n.x + n.w / 2;
+      cy += n.y + n.h / 2;
+    }
+    cx /= nodes.length;
+    cy /= nodes.length;
+    this.mutate(() => {
+      for (const n of nodes) {
+        switch (mode) {
+          case "top": n.y = top; break;
+          case "bottom": n.y = bottom - n.h; break;
+          case "left": n.x = left; break;
+          case "right": n.x = right - n.w; break;
+          case "rowCenter": n.y = cy - n.h / 2; break;
+          case "colCenter": n.x = cx - n.w / 2; break;
+        }
+      }
+    });
+  }
+
+  // ---------- link navigation (MOD+arrows) ----------
+
+  jumpToLinked(dir: "up" | "down" | "left" | "right"): void {
+    const sel = this.selectedNodes();
+    if (sel.length !== 1) return;
+    const from = sel[0];
+    const c0 = nodeCenter(from);
+    let best: GNode | null = null;
+    let bestD = Infinity;
+    for (const it of this.doc.items) {
+      if (it.kind !== "link") continue;
+      const otherId =
+        it.head.node === from.id ? it.tail.node : it.tail.node === from.id ? it.head.node : null;
+      const other = getNode(this.doc, otherId);
+      if (!other || !isItemSelectable(this.doc, other)) continue;
+      const c1 = nodeCenter(other);
+      const dx = c1.x - c0.x, dy = c1.y - c0.y;
+      const along =
+        dir === "up" ? -dy : dir === "down" ? dy : dir === "left" ? -dx : dx;
+      const across = dir === "up" || dir === "down" ? Math.abs(dx) : Math.abs(dy);
+      if (along <= 0 || along < across) continue; // wrong direction / too far off-axis
+      const d = dx * dx + dy * dy;
+      if (d < bestD) {
+        bestD = d;
+        best = other;
+      }
+    }
+    if (!best) return;
+    this.selection = new Set([best.id]);
+    this.ensureVisible(best);
+    this.render();
+  }
+
+  private ensureVisible(n: GNode): void {
+    const r = this.svg.getBoundingClientRect();
+    const c = nodeCenter(n);
+    const sx = c.x * this.zoom + this.panX;
+    const sy = c.y * this.zoom + this.panY;
+    if (sx < 0 || sy < 0 || sx > r.width || sy > r.height) {
+      this.panX = r.width / 2 - c.x * this.zoom;
+      this.panY = r.height / 2 - c.y * this.zoom;
+      this.onViewChange();
+    }
+  }
+
+  // ---------- copy style / paste style (ui-spec §5) ----------
+
+  copyStyle(): void {
+    const first = this.selectedItems()[0];
+    if (!first) return;
+    if (first.kind === "node") {
+      this.styleBuffer = {
+        kind: "node",
+        shape: first.shape,
+        fill: first.fill,
+        stroke: first.stroke,
+        strokeWidth: first.strokeWidth,
+        strokeStyle: first.strokeStyle,
+        textColor: first.textColor,
+        font: structuredClone(first.font),
+      };
+    } else {
+      this.styleBuffer = {
+        kind: "link",
+        stroke: first.stroke,
+        strokeWidth: first.strokeWidth,
+        strokeStyle: first.strokeStyle,
+        textColor: first.textColor,
+        font: structuredClone(first.font),
+        arrowState: first.arrowState,
+        controlCount: first.controlCount,
+      };
+    }
+  }
+
+  canPasteStyle(): boolean {
+    return this.styleBuffer != null && this.selection.size > 0;
+  }
+
+  pasteStyle(): void {
+    const s = this.styleBuffer;
+    if (!s || this.selection.size === 0) return;
+    const targets = this.selectedItems().filter((i) => i.kind === s.kind);
+    if (!targets.length) return;
+    this.mutate(() => {
+      for (const it of targets) {
+        if (s.kind === "node" && it.kind === "node") {
+          it.shape = s.shape;
+          it.fill = s.fill;
+          it.stroke = s.stroke;
+          it.strokeWidth = s.strokeWidth;
+          it.strokeStyle = s.strokeStyle;
+          it.textColor = s.textColor;
+          it.font = structuredClone(s.font);
+          this.refreshAutoSize(it);
+        } else if (s.kind === "link" && it.kind === "link") {
+          it.stroke = s.stroke;
+          it.strokeWidth = s.strokeWidth;
+          it.strokeStyle = s.strokeStyle;
+          it.textColor = s.textColor;
+          it.font = structuredClone(s.font);
+          it.arrowState = s.arrowState;
+          this.setLinkCurve(it, s.controlCount);
+        }
+      }
+    });
+  }
+
+  // ---------- fonts ----------
+
+  /** Apply font fields to every selected item; auto-sized nodes re-fit their label. */
+  applyFontToSelection(patch: Partial<GFont>): void {
+    const targets = this.selectedItems();
+    if (!targets.length) return;
+    this.mutate(() => {
+      for (const it of targets) {
+        Object.assign(it.font, patch);
+        if (it.kind === "node") this.refreshAutoSize(it);
+      }
+    });
+  }
+
+  /** Toggle bold/italic/underline: target state is the inverse of the first selected item's. */
+  toggleFontFlag(flag: "bold" | "italic" | "underline"): void {
+    const first = this.selectedItems()[0];
+    if (!first) return;
+    this.applyFontToSelection({ [flag]: !first.font[flag] });
+  }
+
+  /** Step each selected item's font size through the legacy preset ladder. */
+  fontStep(dir: 1 | -1): void {
+    const targets = this.selectedItems();
+    if (!targets.length) return;
+    this.mutate(() => {
+      for (const it of targets) {
+        const size = it.font.size;
+        let next: number | undefined;
+        if (dir > 0) next = FONT_SIZES.find((s) => s > size);
+        else next = [...FONT_SIZES].reverse().find((s) => s < size);
+        if (next != null) it.font.size = next;
+        if (it.kind === "node") this.refreshAutoSize(it);
+      }
+    });
+  }
+
+  private refreshAutoSize(n: GNode): void {
+    if (!n.autoSized) return;
+    const size = autoSizeFor(n.label, n.font);
+    const cx = n.x + n.w / 2;
+    n.w = size.w;
+    n.h = size.h;
+    n.x = cx - size.w / 2;
+  }
+
+  // ---------- notes / resources ----------
+
+  setNotes(id: string, notes: string): void {
+    const it = this.doc.items.find((i) => i.id === id);
+    if (!it || it.notes === notes) return;
+    this.mutate(() => {
+      it.notes = notes;
+    });
+  }
+
+  /** Attach (or clear, with null) a resource on every selected item. */
+  setResourceOnSelection(resource: GResource | null): void {
+    const targets = this.selectedItems();
+    if (!targets.length) return;
+    this.mutate(() => {
+      for (const it of targets) it.resource = resource ? structuredClone(resource) : null;
+    });
+  }
+
+  /** Rename = open the existing inline label editor on the single selected item. */
+  renameSelection(): void {
+    const sel = [...this.selection];
+    if (sel.length === 1) this.startLabelEdit(sel[0]);
   }
 
   duplicateSelection(): void {
@@ -269,6 +722,10 @@ export class Editor {
         c.tail.node = c.tail.node ? idMap.get(c.tail.node) ?? null : null;
       }
       this.doc.items.push(...clones);
+      // duplicated whole groups stay grouped
+      for (const g of this.doc.groups.filter((x) => x.members.every((m) => idMap.has(m)))) {
+        groupItems(this.doc, g.members.map((m) => idMap.get(m)!));
+      }
       this.selection = new Set(clones.map((c) => c.id));
     });
   }
@@ -317,19 +774,20 @@ export class Editor {
     return created!;
   }
 
-  applyStyleToSelection(patch: Partial<Pick<GNode, "fill" | "stroke" | "textColor" | "shape">> & { arrowState?: number; controlCount?: 0 | 1 | 2 }): void {
+  applyStyleToSelection(patch: StylePatch, kindFilter?: "node" | "link"): void {
     if (this.selection.size === 0) return;
     this.mutate(() => {
       for (const it of this.doc.items) {
         if (!this.selection.has(it.id)) continue;
+        if (kindFilter && it.kind !== kindFilter) continue;
+        if (patch.stroke !== undefined) it.stroke = patch.stroke;
+        if (patch.strokeWidth !== undefined) it.strokeWidth = patch.strokeWidth;
+        if (patch.strokeStyle !== undefined) it.strokeStyle = patch.strokeStyle;
+        if (patch.textColor !== undefined) it.textColor = patch.textColor;
         if (it.kind === "node") {
           if (patch.fill !== undefined) it.fill = patch.fill;
-          if (patch.stroke !== undefined) it.stroke = patch.stroke;
-          if (patch.textColor !== undefined) it.textColor = patch.textColor;
           if (patch.shape !== undefined) it.shape = patch.shape;
         } else {
-          if (patch.stroke !== undefined) it.stroke = patch.stroke;
-          if (patch.textColor !== undefined) it.textColor = patch.textColor;
           if (patch.arrowState !== undefined) it.arrowState = patch.arrowState;
           if (patch.controlCount !== undefined) this.setLinkCurve(it, patch.controlCount);
         }
@@ -390,8 +848,10 @@ export class Editor {
 
   hitTest(w: Pt): GItem | null {
     const slop = Math.max(4 / this.zoom, 2);
-    for (let i = this.doc.items.length - 1; i >= 0; i--) {
-      const it = this.doc.items[i];
+    const order = paintOrder(this.doc);
+    for (let i = order.length - 1; i >= 0; i--) {
+      const it = order[i];
+      if (!isItemSelectable(this.doc, it)) continue;
       if (it.kind === "node") {
         if (w.x < it.x - slop || w.x > it.x + it.w + slop || w.y < it.y - slop || w.y > it.y + it.h + slop) continue;
         if (pointInOutline(w, nodeOutline(it))) return it;
@@ -402,6 +862,14 @@ export class Editor {
         }
       } else {
         const g = this.linkGeometry(it);
+        if (it.headPruned || it.tailPruned) {
+          // pruned link renders as a dot only; only the dot is hittable
+          const r = Math.max(PRUNE_DOT_SIZE / 2, slop);
+          for (const q of prunedDotPoints(it, g.headPt, g.tailPt)) {
+            if ((w.x - q.x) ** 2 + (w.y - q.y) ** 2 <= r * r) return it;
+          }
+          continue;
+        }
         const r = Math.max(it.strokeWidth / 2 + 1, slop);
         for (let j = 0; j < g.flat.length - 1; j++) {
           if (distSqToSegment(w, g.flat[j], g.flat[j + 1]) <= r * r) return it;
@@ -418,6 +886,18 @@ export class Editor {
   private hitNode(w: Pt): GNode | null {
     const hit = this.hitTest(w);
     return hit && hit.kind === "node" ? hit : null;
+  }
+
+  /** Right-click selection rule (legacy interaction.md §4): if the hit item isn't
+   *  already selected, select it (with its whole group), replacing the selection;
+   *  an already-selected item keeps the whole selection. Returns the hit. */
+  contextHit(w: Pt): GItem | null {
+    const hit = this.hitTest(w);
+    if (hit && !this.selection.has(hit.id)) {
+      this.selection = expandToGroups(this.doc, new Set([hit.id]));
+      this.render();
+    }
+    return hit;
   }
 
   // ---------- pointer handling ----------
@@ -451,18 +931,22 @@ export class Editor {
       }
       const hit = this.hitTest(w);
       if (hit) {
+        const unit = expandToGroups(this.doc, new Set([hit.id])); // groups select as a unit
         const additive = e.shiftKey || e.ctrlKey;
         if (additive) {
-          if (this.selection.has(hit.id)) this.selection.delete(hit.id);
-          else this.selection.add(hit.id);
+          if (this.selection.has(hit.id)) for (const id of unit) this.selection.delete(id);
+          else for (const id of unit) this.selection.add(id);
           this.render();
           return; // no drag from a toggle-click
         }
-        if (!this.selection.has(hit.id)) this.selection = new Set([hit.id]);
+        if (!this.selection.has(hit.id)) this.selection = unit;
         this.drag = { kind: "maybeMove", startS: s, startW: w, hitId: hit.id };
         this.render();
       } else {
-        if (!e.shiftKey) this.selection.clear();
+        if (!e.shiftKey) {
+          if (this.selection.size) this.savedSelection = new Set(this.selection);
+          this.selection.clear();
+        }
         this.drag = { kind: "marquee", startW: w, curW: w, toggle: e.shiftKey };
         this.render();
       }
@@ -474,9 +958,19 @@ export class Editor {
       return;
     }
 
-    if (tool === "link") {
+    if (tool === "link" || tool === "combo") {
       const src = this.hitNode(w);
-      if (src) this.drag = { kind: "linkDraw", sourceId: src.id, curW: w, targetId: null, startS: s };
+      if (src) {
+        this.drag = { kind: "linkDraw", sourceId: src.id, curW: w, targetId: null, startS: s, combo: tool === "combo" };
+      } else if (tool === "combo") {
+        // combo tool on blank canvas creates a node right there (legacy VUE-1597)
+        this.createNodeAt(w.x, w.y);
+      }
+      return;
+    }
+
+    if (tool === "zoom") {
+      this.drag = { kind: "zoomRect", startW: w, curW: w, started: false, out: e.shiftKey, startS: s };
       return;
     }
   }
@@ -548,6 +1042,14 @@ export class Editor {
         this.render();
         return;
       }
+      case "zoomRect": {
+        d.curW = w;
+        const dxs = Math.abs(w.x - d.startW.x) * this.zoom;
+        const dys = Math.abs(w.y - d.startW.y) * this.zoom;
+        if (dxs > CREATE_MIN_PX || dys > CREATE_MIN_PX) d.started = true;
+        this.render();
+        return;
+      }
       case "resize": {
         const n = getNode(this.doc, d.nodeId);
         if (!n) return;
@@ -602,8 +1104,8 @@ export class Editor {
 
     switch (d.kind) {
       case "maybeMove": {
-        // plain click on an already-selected item: re-select just it
-        this.selection = new Set([d.hitId]);
+        // plain click on an already-selected item: re-select just it (its whole group)
+        this.selection = expandToGroups(this.doc, new Set([d.hitId]));
         this.render();
         return;
       }
@@ -622,6 +1124,7 @@ export class Editor {
         } else {
           this.selection = new Set(picked);
         }
+        this.selection = expandToGroups(this.doc, this.selection);
         this.render();
         return;
       }
@@ -650,6 +1153,7 @@ export class Editor {
         }
         const srcNode = getNode(this.doc, d.sourceId);
         if (!srcNode) return;
+        let editTarget: string | null = null;
         this.mutate(() => {
           let link: GLink;
           if (d.targetId && !e.shiftKey) {
@@ -660,6 +1164,13 @@ export class Editor {
             );
             // parallel straight links auto-curve, like legacy VUE
             if (hasStraightLinkBetween(this.doc, d.sourceId, d.targetId)) this.setLinkCurve(link, 1);
+          } else if (d.combo && !e.shiftKey) {
+            // combo tool: release over empty space creates the destination node
+            const size = autoSizeFor("New Node", { family: "Arial", size: 12, bold: false, italic: false, underline: false });
+            const dest = makeNode(this.doc, w.x - size.w / 2, w.y - size.h / 2, size.w, size.h, this.defaultShape);
+            this.doc.items.push(dest);
+            link = makeLink(this.doc, { node: d.sourceId, x: 0, y: 0 }, { node: dest.id, x: 0, y: 0 });
+            editTarget = dest.id;
           } else {
             link = makeLink(
               this.doc,
@@ -668,10 +1179,19 @@ export class Editor {
             );
           }
           this.doc.items.push(link);
-          this.selection = new Set([link.id]);
+          this.selection = new Set([editTarget ?? link.id]);
         });
         const id = [...this.selection][0];
         this.startLabelEdit(id, true);
+        return;
+      }
+      case "zoomRect": {
+        if (d.started) {
+          const r = normRect(d.startW, d.curW);
+          if (r.w > 1 && r.h > 1) this.zoomToRect(r);
+        } else {
+          this.zoomStep(d.out ? -1 : 1, { x: e.clientX, y: e.clientY });
+        }
         return;
       }
       case "resize": {
@@ -733,54 +1253,12 @@ export class Editor {
     const target = e.target as HTMLElement;
     if (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT") return;
     const cmd = e.ctrlKey || e.metaKey;
-
-    if (cmd) {
-      switch (e.key.toLowerCase()) {
-        case "z":
-          e.preventDefault();
-          if (e.shiftKey) this.redo();
-          else this.undo();
-          return;
-        case "y":
-          e.preventDefault();
-          this.redo();
-          return;
-        case "a":
-          e.preventDefault();
-          if (e.shiftKey) this.deselectAll();
-          else this.selectAll();
-          return;
-        case "d":
-          e.preventDefault();
-          this.duplicateSelection();
-          return;
-        case "=":
-        case "+":
-          e.preventDefault();
-          this.zoomStep(1);
-          return;
-        case "-":
-          e.preventDefault();
-          this.zoomStep(-1);
-          return;
-        case "]":
-          e.preventDefault();
-          this.zoomFit();
-          return;
-        case "'":
-          e.preventDefault();
-          this.zoomActual();
-          return;
-      }
-      return; // other cmd-chords (O/S/N) are handled by main.ts
-    }
+    if (cmd) return; // command chords are handled by the app shortcut dispatcher (ui/shortcuts.ts)
+    if (e.altKey && e.key.startsWith("Arrow")) return; // ALT+arrows = align, dispatcher-owned
 
     switch (e.key) {
       case " ":
-        if (!this.spaceDown) {
-          this.spaceDown = true;
-          this.updateCursor();
-        }
+        this.setHoldTool(" ", "hand");
         e.preventDefault();
         return;
       case "Delete":
@@ -789,7 +1267,15 @@ export class Editor {
         this.deleteSelection();
         return;
       case "Escape":
-        this.cancelDrag();
+        // priority: exit full screen > cancel drag/marquee > deselect (ui-spec §3)
+        if (document.fullscreenElement) {
+          void document.exitFullscreen();
+          return;
+        }
+        if (this.drag.kind !== "none") {
+          this.cancelDrag();
+          return;
+        }
         this.deselectAll();
         return;
       case "F2":
@@ -829,12 +1315,36 @@ export class Editor {
       case "m":
         this.setTool("hand");
         return;
+      case "r":
+        this.setTool("combo");
+        return;
+      case "x":
+      case "X":
+        this.setHoldTool("x", "node");
+        return;
+      case "`":
+        this.setHoldTool("`", "zoom");
+        return;
+      case "Alt":
+        this.setHoldTool("Alt", "combo");
+        e.preventDefault(); // keep the browser/webview from focusing a menu
+        return;
     }
   }
 
+  /** Hold-down temporary tool (Space=pan, X=node, `=zoom, Alt=combo); reverts on key-up. */
+  private setHoldTool(key: string, tool: Tool): void {
+    if (this.holdKey === key) return;
+    if (this.holdKey != null) return; // one hold tool at a time
+    this.holdKey = key;
+    this.holdTool = tool;
+    this.updateCursor();
+  }
+
   private keyUp(e: KeyboardEvent): void {
-    if (e.key === " ") {
-      this.spaceDown = false;
+    if (this.holdKey != null && e.key.toLowerCase() === this.holdKey.toLowerCase()) {
+      this.holdKey = null;
+      this.holdTool = null;
       this.updateCursor();
     }
   }
@@ -944,10 +1454,20 @@ export class Editor {
   private itemsInRect(r: { x: number; y: number; w: number; h: number }): string[] {
     const out: string[] = [];
     for (const it of this.doc.items) {
+      if (!isItemSelectable(this.doc, it)) continue;
       if (it.kind === "node") {
         if (it.x < r.x + r.w && it.x + it.w > r.x && it.y < r.y + r.h && it.y + it.h > r.y) out.push(it.id);
       } else {
         const g = this.linkGeometry(it);
+        if (it.headPruned || it.tailPruned) {
+          for (const q of prunedDotPoints(it, g.headPt, g.tailPt)) {
+            if (q.x >= r.x && q.x <= r.x + r.w && q.y >= r.y && q.y <= r.y + r.h) {
+              out.push(it.id);
+              break;
+            }
+          }
+          continue;
+        }
         let hit = false;
         for (let j = 0; j < g.flat.length - 1 && !hit; j++) {
           hit = segmentIntersectsRect(g.flat[j], g.flat[j + 1], r);
@@ -1012,11 +1532,13 @@ export class Editor {
     this.itemsG.replaceChildren();
     this.overlayG.replaceChildren();
 
-    for (const it of this.doc.items) {
+    for (const it of paintOrder(this.doc)) {
+      if (!isItemVisible(this.doc, it)) continue;
       if (it.kind === "node") this.renderNode(it);
       else this.renderLink(it);
     }
     this.renderOverlay();
+    this.onRender();
   }
 
   private renderNode(n: GNode): void {
@@ -1035,12 +1557,32 @@ export class Editor {
     if (n.label && this.editingId !== n.id) {
       g.appendChild(this.renderText(n.label, n.x + n.w / 2, n.y + n.h / 2, n.font, n.textColor, "middle"));
     }
+    // small corner glyphs: attachment (top-right), notes (bottom-right)
+    if (n.resource) g.appendChild(badge(n.x + n.w - 5, n.y + 5, "resource", n.resource.spec));
+    if (n.notes) g.appendChild(badge(n.x + n.w - 5, n.y + n.h - 5, "note", n.notes));
     this.itemsG.appendChild(g);
   }
 
   private renderLink(l: GLink): void {
     const geo = this.linkGeometry(l);
     const g = el("g");
+
+    // pruned link: no line/arrows/label, just a ~7px dot at the surviving endpoint
+    if (l.headPruned || l.tailPruned) {
+      for (const q of prunedDotPoints(l, geo.headPt, geo.tailPt)) {
+        const dot = el("circle");
+        dot.setAttribute("cx", String(q.x));
+        dot.setAttribute("cy", String(q.y));
+        dot.setAttribute("r", String(PRUNE_DOT_SIZE / 2));
+        dot.setAttribute("fill", "#C0C0C0"); // legacy lightGray fill
+        dot.setAttribute("stroke", "#404040"); // legacy darkGray outline
+        dot.setAttribute("stroke-width", "1");
+        g.appendChild(dot);
+      }
+      this.itemsG.appendChild(g);
+      return;
+    }
+
     const path = el("path");
     let dPath: string;
     if (geo.ctrl0 && geo.ctrl1)
@@ -1071,6 +1613,8 @@ export class Editor {
       g.appendChild(bg);
       g.appendChild(this.renderText(l.label, geo.mid.x, geo.mid.y, l.font, l.textColor, "middle"));
     }
+    if (l.resource) g.appendChild(badge(geo.mid.x + 9, geo.mid.y - 9, "resource", l.resource.spec));
+    if (l.notes) g.appendChild(badge(geo.mid.x + 9, geo.mid.y + 9, "note", l.notes));
     this.itemsG.appendChild(g);
   }
 
@@ -1134,7 +1678,7 @@ export class Editor {
     // selection chrome
     for (const id of this.selection) {
       const it = this.doc.items.find((i) => i.id === id);
-      if (!it) continue;
+      if (!it || !isItemVisible(this.doc, it)) continue;
       if (it.kind === "node") {
         const outline = el("path");
         outline.setAttribute("d", shapePathData(it.shape, it.x, it.y, it.w, it.h));
@@ -1185,6 +1729,21 @@ export class Editor {
       rect.setAttribute("height", String(r.h));
       rect.setAttribute("fill", "rgba(74,149,255,0.08)");
       rect.setAttribute("stroke", "#808080");
+      rect.setAttribute("stroke-width", String(sw));
+      rect.setAttribute("stroke-dasharray", `${4 / this.zoom} ${3 / this.zoom}`);
+      this.overlayG.appendChild(rect);
+    }
+
+    // zoom-tool drag rect
+    if (this.drag.kind === "zoomRect" && this.drag.started) {
+      const r = normRect(this.drag.startW, this.drag.curW);
+      const rect = el("rect");
+      rect.setAttribute("x", String(r.x));
+      rect.setAttribute("y", String(r.y));
+      rect.setAttribute("width", String(r.w));
+      rect.setAttribute("height", String(r.h));
+      rect.setAttribute("fill", "rgba(74,149,255,0.06)");
+      rect.setAttribute("stroke", SELECTION_COLOR);
       rect.setAttribute("stroke-width", String(sw));
       rect.setAttribute("stroke-dasharray", `${4 / this.zoom} ${3 / this.zoom}`);
       this.overlayG.appendChild(rect);
@@ -1251,8 +1810,44 @@ export class Editor {
 
 // ---------- helpers ----------
 
+const PRUNE_DOT_SIZE = 7; // legacy LWLink.PruneDotSize
+
+/** Dot location(s) for a pruned link: the surviving (unpruned) endpoint; both when
+ *  both ends are pruned. */
+function prunedDotPoints(l: GLink, headPt: Pt, tailPt: Pt): Pt[] {
+  if (l.headPruned && !l.tailPruned) return [tailPt];
+  if (l.tailPruned && !l.headPruned) return [headPt];
+  return [headPt, tailPt];
+}
+
 function el(name: string): SVGElement {
   return document.createElementNS("http://www.w3.org/2000/svg", name);
+}
+
+/** Small corner glyph marking an attachment (blue dot) or note (amber dog-ear). */
+function badge(cx: number, cy: number, kind: "resource" | "note", tip: string): SVGElement {
+  const g = el("g");
+  if (kind === "resource") {
+    const c = el("circle");
+    c.setAttribute("cx", String(cx));
+    c.setAttribute("cy", String(cy));
+    c.setAttribute("r", "3");
+    c.setAttribute("fill", "#4A95FF");
+    c.setAttribute("stroke", "#ffffff");
+    c.setAttribute("stroke-width", "0.75");
+    g.appendChild(c);
+  } else {
+    const t = el("path");
+    t.setAttribute("d", `M${cx - 3},${cy + 3} L${cx + 3},${cy + 3} L${cx + 3},${cy - 3} Z`);
+    t.setAttribute("fill", "#F2C94C");
+    t.setAttribute("stroke", "#A8861D");
+    t.setAttribute("stroke-width", "0.6");
+    g.appendChild(t);
+  }
+  const title = el("title");
+  title.textContent = kind === "resource" ? `Attachment: ${tip}` : `Notes: ${tip.length > 120 ? tip.slice(0, 120) + "…" : tip}`;
+  g.appendChild(title);
+  return g;
 }
 
 function normRect(a: Pt, b: Pt): { x: number; y: number; w: number; h: number } {

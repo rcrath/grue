@@ -11,7 +11,7 @@ export function isTauri(): boolean {
 }
 
 const FILTERS = [
-  { name: "GrrrphUE map", extensions: ["grue"] },
+  { name: "Grue map", extensions: ["grue"] },
   { name: "VUE map", extensions: ["vue"] },
   { name: "All files", extensions: ["*"] },
 ];
@@ -69,6 +69,29 @@ export async function saveFileTo(path: string, text: string): Promise<void> {
     return;
   }
   await saveFileAs(baseName(path), text);
+}
+
+/** Re-read a previously opened file (File > Revert). Tauri only — browser files have no path. */
+export async function readFile(path: string): Promise<string> {
+  const { readTextFile } = await import("@tauri-apps/plugin-fs");
+  return readTextFile(path);
+}
+
+/** Pick any file and return its path (Tauri) or its name (browser fallback — no
+ *  real path is available in a browser, the name is stored as the resource spec). */
+export async function pickFilePath(): Promise<string | null> {
+  if (isTauri()) {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const path = await open({ multiple: false });
+    return typeof path === "string" ? path : null;
+  }
+  return new Promise((resolve) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.onchange = () => resolve(input.files?.[0]?.name ?? null);
+    input.addEventListener("cancel", () => resolve(null));
+    input.click();
+  });
 }
 
 export function baseName(path: string): string {

@@ -2,8 +2,8 @@
 // Format spec extracted from the legacy source: docs/legacy-specs/format.md.
 
 import {
-  GDoc, GFont, GLink, GNode, LinkEnd, NodeShape,
-  LINK_DEFAULTS, NODE_DEFAULTS, newDoc,
+  GDoc, GFont, GLayer, GLink, GNode, GResource, LinkEnd, NodeShape,
+  LINK_DEFAULTS, NODE_DEFAULTS, newDoc, paintOrder,
 } from "./model";
 
 // ---- codecs ----
@@ -94,6 +94,22 @@ function unescapeVueText(s: string): string {
     .replace(/%pct;/g, "%");
 }
 
+/** Notes element: collapse castor's re-indentation first, then unescape
+ *  (%nl; newline, %tab; tab, %sp; space, %pct; percent — legacy LWComponent). */
+function parseVueNotes(s: string): string {
+  const collapsed = s.replace(/\n[ \t]*%nl;/g, "%nl;").replace(/\n[ \t]*/g, " ").trim();
+  return unescapeVueText(collapsed);
+}
+
+/** Legacy notes escaping on write: % first, then newlines/tabs/double spaces. */
+function escapeVueNotes(s: string): string {
+  return s
+    .replace(/%/g, "%pct;")
+    .replace(/\r\n|\r|\n/g, "%nl;")
+    .replace(/\t/g, "%tab;")
+    .replace(/ {2}/g, " %sp;");
+}
+
 // ---- import ----
 
 const SHAPE_MAP: Record<string, NodeShape> = {
@@ -155,21 +171,44 @@ export function importVue(text: string): VueImportResult {
     };
   }
 
+  // Layer shells (modelVersion >= 5): <layer> elements are empty; components carry
+  // a layerID attribute. Pre-layer files have neither — one default layer at the end.
+  const layers: GLayer[] = [];
+  for (const el of Array.from(root.children)) {
+    if (el.tagName !== "layer") continue;
+    const lid = el.getAttribute("ID");
+    if (!lid) continue;
+    layers.push({
+      id: lid,
+      name: el.getAttribute("label") || `Layer ${layers.length + 1}`,
+      hidden: el.getAttribute("hidden") === "true",
+      locked: el.getAttribute("locked") === "true",
+    });
+  }
+  const layerIds = new Set(layers.map((l) => l.id));
+
+  /** Layer for a component: its layerID attribute, else the enclosing <layer> element. */
+  const layerFor = (el: Element, enclosing: string | null): string => {
+    const ref = el.getAttribute("layerID");
+    if (ref && layerIds.has(ref)) return ref;
+    return enclosing ?? "";
+  };
+
   // Old→new id mapping is identity (legacy ids are numeric strings) but guard dupes.
   const seenIds = new Set<string>();
-  const pendingLinks: { el: Element; ox: number; oy: number }[] = [];
+  const pendingLinks: { el: Element; ox: number; oy: number; layerId: string }[] = [];
 
-  const importChildren = (parent: Element, ox: number, oy: number, scale: number) => {
+  const importChildren = (parent: Element, ox: number, oy: number, scale: number, layerId: string | null) => {
     for (const el of Array.from(parent.children)) {
       if (el.tagName === "layer") {
         // layers sit at 0,0 scale 1; their children are map coordinates
-        importChildren(el, 0, 0, 1);
+        importChildren(el, 0, 0, 1, el.getAttribute("ID"));
         continue;
       }
       if (el.tagName !== "child") continue;
       const t = (el.getAttribute("xsi:type") || el.getAttributeNS("http://www.w3.org/2001/XMLSchema-instance", "type") || "").toLowerCase();
       if (t === "link") {
-        pendingLinks.push({ el, ox, oy });
+        pendingLinks.push({ el, ox, oy, layerId: layerFor(el, layerId) });
         continue;
       }
       if (t === "node" || t === "text" || t === "") {
@@ -179,6 +218,7 @@ export function importVue(text: string): VueImportResult {
             warnings.push(`Duplicate id ${n.id}; skipped a component.`);
             continue;
           }
+          n.layer = layerFor(el, layerId);
           seenIds.add(n.id);
           doc.items.push(n);
           // nested children (nodes inside nodes): flatten, scaled 75% per level
@@ -187,6 +227,7 @@ export function importVue(text: string): VueImportResult {
             relativeCoords ? n.x : 0,
             relativeCoords ? n.y : 0,
             scale * 0.75,
+            n.layer || layerId,
           );
         }
         continue;
@@ -194,7 +235,7 @@ export function importVue(text: string): VueImportResult {
       if (t === "group") {
         const gx = parseFloat(el.getAttribute("x") || "0") || 0;
         const gy = parseFloat(el.getAttribute("y") || "0") || 0;
-        importChildren(el, relativeCoords ? ox + gx : 0, relativeCoords ? oy + gy : 0, scale);
+        importChildren(el, relativeCoords ? ox + gx : 0, relativeCoords ? oy + gy : 0, scale, layerFor(el, layerId));
         continue;
       }
       warnings.push(`Skipped unsupported component type "${t || "unknown"}".`);
@@ -228,9 +269,6 @@ export function importVue(text: string): VueImportResult {
     const strokeWidth = parseFloat(el.getAttribute("strokeWidth") || "1");
     const strokeStyle = parseInt(el.getAttribute("strokeStyle") || "0", 10) || 0;
 
-    const res = directChild(el, "resource");
-    const url = res?.getAttribute("spec") || null;
-
     return {
       kind: "node",
       id,
@@ -244,13 +282,17 @@ export function importVue(text: string): VueImportResult {
       textColor,
       font,
       autoSized: el.getAttribute("autoSized") === "true",
-      url,
+      hidden: el.getAttribute("hidden") === "true",
+      collapsed: false, // legacy collapse is a global mode, never persisted per node
+      layer: "", // assigned by the caller
+      notes: importNotes(el),
+      resource: importResource(el),
     };
   };
 
-  importChildren(root, 0, 0, 1);
+  importChildren(root, 0, 0, 1, null);
 
-  for (const { el, ox, oy } of pendingLinks) {
+  for (const { el, ox, oy, layerId } of pendingLinks) {
     const id = el.getAttribute("ID");
     if (!id || seenIds.has(id)) continue;
     const id1 = directChildText(el, "ID1");
@@ -289,19 +331,66 @@ export function importVue(text: string): VueImportResult {
       strokeStyle: parseInt(el.getAttribute("strokeStyle") || "0", 10) || 0,
       textColor: parseVueColor(directChildText(el, "textColor")) || LINK_DEFAULTS.textColor,
       font: parseVueFont(directChildText(el, "font"), LINK_DEFAULTS.font()),
+      hidden: el.getAttribute("hidden") === "true",
+      headPruned: directChildText(el, "headUserPruned") === "true",
+      tailPruned: directChildText(el, "tailUserPruned") === "true",
+      layer: layerId,
+      notes: importNotes(el),
+      resource: importResource(el),
     };
     seenIds.add(id);
     doc.items.push(link);
   }
 
   let maxId = 0;
-  for (const sid of seenIds) {
+  const bump = (sid: string) => {
     const n = parseInt(sid, 10);
     if (Number.isFinite(n) && n > maxId) maxId = n;
+  };
+  for (const sid of seenIds) bump(sid);
+  for (const l of layers) bump(l.id);
+
+  // pre-layer files (modelVersion < 5): one default layer holds everything
+  if (layers.length === 0)
+    layers.push({ id: String(++maxId), name: "Layer 1", hidden: false, locked: false });
+  doc.layers = layers;
+  for (const it of doc.items) {
+    if (!it.layer || !layers.some((l) => l.id === it.layer)) it.layer = layers[0].id;
   }
+  // legacy restore picks the layer named "Default", else the second layer, else the first
+  const active = layers.find((l) => l.name === "Default") ?? (layers.length > 1 ? layers[1] : layers[0]);
+  doc.activeLayer = active.id;
+
   doc.nextId = maxId + 1;
 
   return { doc, warnings };
+}
+
+function importNotes(el: Element): string {
+  const c = directChild(el, "notes");
+  return c ? parseVueNotes(c.textContent ?? "") : "";
+}
+
+/** Legacy <resource>: spec attribute (path or URL), optional <title>, and
+ *  <property key= value=/> children (or the propertyEntry entryKey/entryValue form). */
+function importResource(el: Element): GResource | null {
+  const res = directChild(el, "resource");
+  if (!res) return null;
+  const spec = res.getAttribute("spec") || "";
+  if (!spec) return null;
+  const properties: { key: string; value: string }[] = [];
+  for (const p of Array.from(res.children)) {
+    if (p.tagName !== "property") continue;
+    let key = p.getAttribute("key");
+    let value = p.getAttribute("value");
+    if (key == null) {
+      key = directChildText(p, "entryKey");
+      value = directChildText(p, "entryValue");
+    }
+    if (key) properties.push({ key, value: value ?? "" });
+  }
+  const title = directChildText(res, "title");
+  return { spec, title: title || null, properties };
 }
 
 function directChild(el: Element, tag: string): Element | null {
@@ -325,13 +414,16 @@ function pointOf(el: Element, tag: string, ox: number, oy: number): { x: number;
 
 // ---- export ----
 
-/** Minimal .vue writer: nodes + links, modelVersion 0 (absolute coordinates),
- *  mapping version 1.1 — loadable by legacy VUE. */
+/** Minimal .vue writer: nodes + links + layer shells, modelVersion 5,
+ *  mapping version 1.1 — loadable by legacy VUE. Children are written flat under
+ *  LW-MAP grouped by layer (paint order) with layerID references, exactly like
+ *  legacy VUE persists layered maps. All coordinates are absolute; that is safe
+ *  because every exported component is a top-level child of a layer at 0,0. */
 export function exportVue(doc: GDoc, mapLabel: string): string {
   const lines: string[] = [];
   lines.push(`<!-- Tufts VUE concept-map (${xmlEscape(mapLabel)}) -->`);
   lines.push(`<!-- Do Not Remove: VUE mapping @version(1.1) lw_mapping_1_1.xml -->`);
-  lines.push(`<!-- Written by GrrrphUE -->`);
+  lines.push(`<!-- Written by grue -->`);
   lines.push(`<?xml version="1.0" encoding="US-ASCII"?>`);
   lines.push(
     `<LW-MAP xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" ` +
@@ -357,21 +449,25 @@ export function exportVue(doc: GDoc, mapLabel: string): string {
     pentagon: "pentagon",
   };
 
-  for (const it of doc.items) {
+  // Children flat under LW-MAP in global paint order (grouped by layer), each
+  // tagged with its layerID — the shape legacy VUE writes for layered maps.
+  for (const it of paintOrder(doc)) {
+    const layerRef = ` layerID="${xmlEscape(it.layer)}"`;
+    const hiddenAttr = it.hidden ? ` hidden="true"` : "";
     if (it.kind === "node") {
       lines.push(
-        `  <child ID="${xmlEscape(it.id)}" label="${xmlEscape(it.label)}" ` +
+        `  <child ID="${xmlEscape(it.id)}" label="${xmlEscape(it.label)}"${layerRef} ` +
           `x="${fx(it.x)}" y="${fx(it.y)}" width="${fx(it.w)}" height="${fx(it.h)}" ` +
           `strokeWidth="${fx(it.strokeWidth)}"${it.strokeStyle ? ` strokeStyle="${it.strokeStyle}"` : ""} ` +
-          `autoSized="${it.autoSized}" xsi:type="node">`,
+          `autoSized="${it.autoSized}"${hiddenAttr} xsi:type="node">`,
       );
+      if (it.notes) lines.push(`    <notes>${xmlEscape(escapeVueNotes(it.notes))}</notes>`);
+      lines.push(...resourceXml(it.resource));
       const fill = toVueColor(it.fill);
       if (fill) lines.push(`    <fillColor>${fill}</fillColor>`);
       lines.push(`    <strokeColor>${toVueColor(it.stroke)}</strokeColor>`);
       lines.push(`    <textColor>${toVueColor(it.textColor)}</textColor>`);
       lines.push(`    <font>${xmlEscape(toVueFont(it.font))}</font>`);
-      if (it.url)
-        lines.push(`    <resource referenceCreated="0" size="-1" spec="${xmlEscape(it.url)}" type="0" xsi:type="map-resource"/>`);
       lines.push(`    <nodeFilter/>`);
       if (it.shape === "roundRect")
         lines.push(`    <shape arcwidth="20.0" archeight="20.0" xsi:type="roundRect"/>`);
@@ -379,12 +475,14 @@ export function exportVue(doc: GDoc, mapLabel: string): string {
       lines.push(`  </child>`);
     } else {
       lines.push(
-        `  <child ID="${xmlEscape(it.id)}"${it.label ? ` label="${xmlEscape(it.label)}"` : ""} ` +
+        `  <child ID="${xmlEscape(it.id)}"${it.label ? ` label="${xmlEscape(it.label)}"` : ""}${layerRef} ` +
           `x="${fx(Math.min(it.head.x, it.tail.x))}" y="${fx(Math.min(it.head.y, it.tail.y))}" ` +
           `width="${fx(Math.abs(it.head.x - it.tail.x) || 1)}" height="${fx(Math.abs(it.head.y - it.tail.y) || 1)}" ` +
           `strokeWidth="${fx(it.strokeWidth)}"${it.strokeStyle ? ` strokeStyle="${it.strokeStyle}"` : ""} ` +
-          `controlCount="${it.controlCount}" arrowState="${it.arrowState}" xsi:type="link">`,
+          `controlCount="${it.controlCount}" arrowState="${it.arrowState}"${hiddenAttr} xsi:type="link">`,
       );
+      if (it.notes) lines.push(`    <notes>${xmlEscape(escapeVueNotes(it.notes))}</notes>`);
+      lines.push(...resourceXml(it.resource));
       lines.push(`    <strokeColor>${toVueColor(it.stroke)}</strokeColor>`);
       lines.push(`    <textColor>${toVueColor(it.textColor)}</textColor>`);
       lines.push(`    <font>${xmlEscape(toVueFont(it.font))}</font>`);
@@ -397,15 +495,41 @@ export function exportVue(doc: GDoc, mapLabel: string): string {
         lines.push(`    <ctrlPoint0 x="${fx(it.ctrl0.x)}" y="${fx(it.ctrl0.y)}"/>`);
       if (it.controlCount === 2 && it.ctrl1)
         lines.push(`    <ctrlPoint1 x="${fx(it.ctrl1.x)}" y="${fx(it.ctrl1.y)}"/>`);
+      if (it.headPruned) lines.push(`    <headUserPruned>true</headUserPruned>`);
+      if (it.tailPruned) lines.push(`    <tailUserPruned>true</tailUserPruned>`);
       lines.push(`  </child>`);
     }
   }
 
+  // empty layer shells, bottom-to-top (contents stay flat above, per legacy)
+  for (const l of doc.layers) {
+    lines.push(
+      `  <layer ID="${xmlEscape(l.id)}" label="${xmlEscape(l.name)}" x="0.0" y="0.0" ` +
+        `strokeWidth="0.0" autoSized="false"` +
+        `${l.hidden ? ` hidden="true"` : ""}${l.locked ? ` locked="true"` : ""}/>`,
+    );
+  }
+
   lines.push(`  <userZoom>${doc.userZoom}</userZoom>`);
   lines.push(`  <userOrigin x="${fx(doc.userOrigin.x)}" y="${fx(doc.userOrigin.y)}"/>`);
-  lines.push(`  <modelVersion>0</modelVersion>`);
+  lines.push(`  <modelVersion>5</modelVersion>`);
   lines.push(`</LW-MAP>`);
   return lines.join("\n") + "\n";
+}
+
+/** Legacy <resource> element: spec attribute plus optional <title> and <property> children. */
+function resourceXml(r: GResource | null): string[] {
+  if (!r) return [];
+  const open =
+    `    <resource referenceCreated="0" size="-1" spec="${xmlEscape(r.spec)}" ` +
+    `type="0" xsi:type="map-resource"`;
+  if (!r.title && r.properties.length === 0) return [open + "/>"];
+  const lines = [open + ">"];
+  if (r.title) lines.push(`      <title>${xmlEscape(r.title)}</title>`);
+  for (const p of r.properties)
+    lines.push(`      <property key="${xmlEscape(p.key)}" value="${xmlEscape(p.value)}"/>`);
+  lines.push(`    </resource>`);
+  return lines;
 }
 
 function fx(n: number): string {

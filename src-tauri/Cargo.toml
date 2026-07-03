@@ -1,11 +1,11 @@
 [package]
-name = "grrrphue"
+name = "grue"
 version = "0.1.0"
-description = "GrrrphUE — visual knowledge-mapping application"
+description = "grue — visual knowledge-mapping application"
 edition = "2021"
 
 [lib]
-name = "grrrphue_lib"
+name = "grue_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

@@ -1,7 +1,7 @@
 {
-  "name": "grrrphue",
+  "name": "grue",
   "version": "0.1.0",
-  "description": "GrrrphUE — visual knowledge-mapping application, functional successor to Tufts VUE",
+  "description": "grue — visual knowledge-mapping application, functional successor to Tufts VUE",
   "type": "module",
   "scripts": {
     "dev": "vite",

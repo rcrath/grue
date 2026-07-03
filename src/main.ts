@@ -2,10 +2,17 @@ import "./style.css";
 import { Editor, Tool } from "./ui/editor";
 import { NODE_SHAPES, NodeShape, docFromJson, docToJson, newDoc } from "./core/model";
 import { exportVue, importVue } from "./core/vueFormat";
-import { baseName, isTauri, openFile, saveFileAs, saveFileTo } from "./ui/platform";
+import { baseName, isTauri, openFile, readFile, saveFileAs, saveFileTo } from "./ui/platform";
+import { FormatPalette } from "./ui/palette";
+import { buildActions } from "./ui/actions";
+import { installMenuBar } from "./ui/menubar";
+import { installContextMenu } from "./ui/contextmenu";
+import { installShortcuts } from "./ui/shortcuts";
+import { promptText } from "./ui/dialogs";
 
 const app = document.getElementById("app")!;
 app.innerHTML = `
+  <div id="menubar-host"></div>
   <div id="toolbar">
     <div class="tool-group" id="tools"></div>
     <div class="sep"></div>
@@ -57,6 +64,7 @@ const toolDefs: [Tool, string, string][] = [
   ["select", "select", "Selection tool (s)"],
   ["node", "node", "Node tool (n): click or drag to create"],
   ["link", "link", "Link tool (l): drag from node to node"],
+  ["combo", "rapid", "Rapid-link tool (r): link to empty space to create the node, hold Alt for one-shot"],
   ["hand", "pan", "Pan tool (m), or hold Space"],
 ];
 for (const [t, label, title] of toolDefs) {
@@ -123,7 +131,7 @@ const statusZoom = document.getElementById("status-zoom")!;
 
 function refreshChrome(): void {
   statusFile.textContent = currentName + (editor.dirty ? " •" : "");
-  document.title = `${currentName}${editor.dirty ? " •" : ""} — GrrrphUE`;
+  document.title = `${currentName}${editor.dirty ? " •" : ""} — grue`;
   statusZoom.textContent = `${Math.round(editor.zoom * 100)}%`;
   undoBtn.disabled = !editor.canUndo();
   redoBtn.disabled = !editor.canRedo();
@@ -131,6 +139,7 @@ function refreshChrome(): void {
   statusHint.textContent =
     editor.tool === "node" ? "click or drag on the canvas to create a node"
     : editor.tool === "link" ? "drag from one node to another to connect them"
+    : editor.tool === "combo" ? "drag from a node; release on empty space to create the target node"
     : editor.tool === "hand" ? "drag to pan"
     : "";
 }
@@ -154,26 +163,57 @@ function newMap(): void {
   refreshChrome();
 }
 
+/** Load .grue/.vue text into the editor (shared by Open, Open from URL, drag & drop). */
+function loadContent(name: string, text: string, path: string | null): void {
+  if (name.toLowerCase().endsWith(".vue")) {
+    const { doc, warnings } = importVue(text);
+    editor.setDoc(doc);
+    editor.zoomFit();
+    currentPath = null; // imported: force Save As so we don't overwrite the .vue
+    currentName = name.replace(/\.vue$/i, ".grue");
+    editor.dirty = true;
+    if (warnings.length) console.warn("VUE import warnings:", warnings);
+  } else {
+    editor.setDoc(docFromJson(text));
+    currentPath = path;
+    currentName = name;
+  }
+}
+
 async function doOpen(): Promise<void> {
   if (!confirmDiscard()) return;
   const f = await openFile();
   if (!f) return;
   try {
-    if (f.name.toLowerCase().endsWith(".vue")) {
-      const { doc, warnings } = importVue(f.text);
-      editor.setDoc(doc);
-      editor.zoomFit();
-      currentPath = null; // imported: force Save As so we don't overwrite the .vue
-      currentName = f.name.replace(/\.vue$/i, ".grue");
-      editor.dirty = true;
-      if (warnings.length) console.warn("VUE import warnings:", warnings);
-    } else {
-      editor.setDoc(docFromJson(f.text));
-      currentPath = f.path;
-      currentName = f.name;
-    }
+    loadContent(f.name, f.text, f.path);
   } catch (err) {
     alert(`Could not open ${f.name}:\n${err instanceof Error ? err.message : err}`);
+  }
+  refreshChrome();
+}
+
+async function doOpenUrl(): Promise<void> {
+  if (!confirmDiscard()) return;
+  const url = await promptText({ title: "Open from URL", label: "URL", placeholder: "https://example.com/map.grue" });
+  if (!url || !url.trim()) return;
+  const spec = url.trim();
+  try {
+    const res = await fetch(spec);
+    if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+    const text = await res.text();
+    let name = "untitled.grue";
+    try {
+      name = baseName(decodeURIComponent(new URL(spec).pathname)) || name;
+    } catch {
+      // unparseable URL path: keep the fallback name
+    }
+    loadContent(name, text, null);
+    if (!name.toLowerCase().endsWith(".vue")) {
+      currentPath = null; // came from the network — force Save As
+      editor.dirty = true;
+    }
+  } catch (err) {
+    alert(`Could not open ${spec}:\n${err instanceof Error ? err.message : err}`);
   }
   refreshChrome();
 }
@@ -198,34 +238,57 @@ async function doSaveAs(): Promise<void> {
   refreshChrome();
 }
 
+async function doRevert(): Promise<void> {
+  if (!currentPath || !editor.dirty) return;
+  if (!window.confirm("Revert to the last saved version? Your unsaved changes will be lost.")) return;
+  try {
+    const text = await readFile(currentPath);
+    editor.setDoc(docFromJson(text));
+  } catch (err) {
+    alert(`Could not revert:\n${err instanceof Error ? err.message : err}`);
+  }
+  refreshChrome();
+}
+
 async function doExportVue(): Promise<void> {
   editor.prepareForSave();
   const name = currentName.replace(/\.grue$/i, "") + ".vue";
   await saveFileAs(name, exportVue(editor.doc, name));
 }
 
-// ---------- global shortcuts ----------
-
-window.addEventListener("keydown", (e) => {
-  const cmd = e.ctrlKey || e.metaKey;
-  if (!cmd) return;
-  switch (e.key.toLowerCase()) {
-    case "o":
-      e.preventDefault();
-      doOpen();
-      break;
-    case "s":
-      e.preventDefault();
-      if (e.shiftKey) doSaveAs();
-      else doSave();
-      break;
-    case "n":
-      // Ctrl+N: new node at the pointer (legacy VUE), not new window
-      e.preventDefault();
-      editor.createNodeAt(...lastCanvasPoint());
-      break;
+async function doExit(): Promise<void> {
+  if (!confirmDiscard()) return;
+  editor.dirty = false; // confirmed: don't double-prompt via beforeunload
+  if (isTauri()) {
+    const { getCurrentWindow } = await import("@tauri-apps/api/window");
+    await getCurrentWindow().close();
+  } else {
+    window.close(); // browser dev: usually a no-op, degrade gracefully
   }
-});
+}
+
+// ---------- menus / palette / shortcuts ----------
+
+const palette = new FormatPalette(editor);
+const actions = buildActions(
+  editor,
+  {
+    open: () => void doOpen(),
+    openUrl: () => void doOpenUrl(),
+    save: () => void doSave(),
+    saveAs: () => void doSaveAs(),
+    revert: () => void doRevert(),
+    canRevert: () => currentPath != null && editor.dirty,
+    newMap,
+    exportVue: () => void doExportVue(),
+    exit: () => void doExit(),
+    newNodeAtCursor: () => void editor.createNodeAt(...lastCanvasPoint()),
+  },
+  palette,
+);
+installMenuBar(document.getElementById("menubar-host")!, actions, editor);
+installContextMenu(document.getElementById("canvas")!, editor, actions);
+installShortcuts(actions);
 
 let lastMouse: [number, number] = [innerWidth / 2, innerHeight / 2];
 window.addEventListener("pointermove", (e) => (lastMouse = [e.clientX, e.clientY]));
@@ -243,19 +306,7 @@ window.addEventListener("drop", async (e) => {
   if (!confirmDiscard()) return;
   const text = await f.text();
   try {
-    if (f.name.toLowerCase().endsWith(".vue")) {
-      const { doc, warnings } = importVue(text);
-      editor.setDoc(doc);
-      editor.zoomFit();
-      currentPath = null;
-      currentName = f.name.replace(/\.vue$/i, ".grue");
-      editor.dirty = true;
-      if (warnings.length) console.warn("VUE import warnings:", warnings);
-    } else {
-      editor.setDoc(docFromJson(text));
-      currentPath = null;
-      currentName = f.name;
-    }
+    loadContent(f.name, text, null);
   } catch (err) {
     alert(`Could not open ${f.name}:\n${err instanceof Error ? err.message : err}`);
   }
@@ -267,10 +318,11 @@ window.addEventListener("beforeunload", (e) => {
 });
 
 // debug/automation hook (also used by smoke tests)
-(window as unknown as Record<string, unknown>).__grrrphue = {
+(window as unknown as Record<string, unknown>).__grue = {
   editor,
   importVue,
   exportVue,
   docToJson,
   docFromJson,
+  actions,
 };

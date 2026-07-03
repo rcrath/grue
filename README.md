@@ -1,4 +1,4 @@
-# GrrrphUE
+# grue
 # Project brief
 
 Build a future-hardened, open-source functional successor to VUE based on the public `rpavlik/VUE` `2025` branch, but preserve functionality rather than implementation.
@@ -71,7 +71,7 @@ Nodes-and-edges MVP implemented (delivery plan steps 1, 2, and the node/link par
 - Extracted legacy behavior specs live in docs/legacy-specs/.
 
 Build (Windows): `npm install`, then `npx tauri build`.
-Artifacts: portable exe at `src-tauri/target/release/grrrphue.exe`,
+Artifacts: portable exe at `src-tauri/target/release/Grue.exe`,
 installer at `src-tauri/target/release/bundle/nsis/`.
 Dev: `npm run tauri dev` (desktop) or `npm run dev` (browser, file dialogs fall back
 to download/upload).
