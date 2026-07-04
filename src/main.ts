@@ -3,12 +3,14 @@ import { Editor, Tool } from "./ui/editor";
 import { NODE_SHAPES, NodeShape, docFromJson, docToJson, newDoc } from "./core/model";
 import { exportVue, importVue } from "./core/vueFormat";
 import { baseName, isTauri, openFile, readFile, saveFileAs, saveFileTo } from "./ui/platform";
-import { FormatPalette } from "./ui/palette";
 import { buildActions } from "./ui/actions";
 import { installMenuBar } from "./ui/menubar";
 import { installContextMenu } from "./ui/contextmenu";
 import { installShortcuts } from "./ui/shortcuts";
 import { promptText } from "./ui/dialogs";
+import { createPanels } from "./ui/panels";
+import { getPref, setPref } from "./ui/prefs";
+import { PREF_AUTOSAVE, PREF_DEFAULT_SHAPE, PREF_PANNER_ON_START } from "./ui/preferences";
 
 const app = document.getElementById("app")!;
 app.innerHTML = `
@@ -186,8 +188,41 @@ async function doOpen(): Promise<void> {
   if (!f) return;
   try {
     loadContent(f.name, f.text, f.path);
+    if (f.path) addRecent(f.path);
   } catch (err) {
     alert(`Could not open ${f.name}:\n${err instanceof Error ? err.message : err}`);
+  }
+  refreshChrome();
+}
+
+// ---------- recently opened (localStorage; Tauri-only — browser files have no path) ----------
+
+function recentFiles(): string[] {
+  return isTauri() ? getPref<string[]>("recentFiles", []) : [];
+}
+
+function addRecent(path: string | null): void {
+  if (!isTauri() || !path) return;
+  const list = recentFiles().filter((x) => x !== path);
+  list.unshift(path);
+  setPref("recentFiles", list.slice(0, 8));
+}
+
+function dropRecent(path: string): void {
+  setPref("recentFiles", recentFiles().filter((x) => x !== path));
+}
+
+async function openRecent(index: number): Promise<void> {
+  const path = recentFiles()[index];
+  if (!path) return;
+  if (!confirmDiscard()) return;
+  try {
+    const text = await readFile(path);
+    loadContent(baseName(path), text, path);
+    addRecent(path); // bump to the top of the list
+  } catch (err) {
+    alert(`Could not open ${path}:\n${err instanceof Error ? err.message : err}`);
+    dropRecent(path);
   }
   refreshChrome();
 }
@@ -222,6 +257,7 @@ async function doSave(): Promise<void> {
   if (!currentPath) return doSaveAs();
   editor.prepareForSave();
   await saveFileTo(currentPath, docToJson(editor.doc));
+  addRecent(currentPath);
   editor.markSaved();
   refreshChrome();
 }
@@ -233,6 +269,7 @@ async function doSaveAs(): Promise<void> {
   if (isTauri()) {
     currentPath = path;
     currentName = baseName(path);
+    addRecent(path);
   }
   editor.markSaved();
   refreshChrome();
@@ -267,9 +304,12 @@ async function doExit(): Promise<void> {
   }
 }
 
-// ---------- menus / palette / shortcuts ----------
+// ---------- menus / panels / shortcuts ----------
 
-const palette = new FormatPalette(editor);
+const panels = createPanels(editor, {
+  getPath: () => currentPath,
+  getName: () => currentName,
+});
 const actions = buildActions(
   editor,
   {
@@ -280,15 +320,35 @@ const actions = buildActions(
     revert: () => void doRevert(),
     canRevert: () => currentPath != null && editor.dirty,
     newMap,
+    closeMap: newMap, // Close Map = new-map-with-discard-check semantics
     exportVue: () => void doExportVue(),
     exit: () => void doExit(),
     newNodeAtCursor: () => void editor.createNodeAt(...lastCanvasPoint()),
+    recentFiles,
+    openRecent: (i) => void openRecent(i),
   },
-  palette,
+  panels,
 );
-installMenuBar(document.getElementById("menubar-host")!, actions, editor);
+installMenuBar(document.getElementById("menubar-host")!, actions, editor, recentFiles);
 installContextMenu(document.getElementById("canvas")!, editor, actions);
 installShortcuts(actions);
+
+// panels re-sync after every render (doc, selection, or view changed)
+editor.onRender = () => panels.refreshAll();
+
+// ---------- preferences / startup state ----------
+
+editor.defaultShape = getPref<NodeShape>(PREF_DEFAULT_SHAPE, "roundRect");
+shapePick.value = editor.defaultShape;
+
+for (const p of panels.all()) p.restore(); // reopen panels left open last session
+if (getPref(PREF_PANNER_ON_START, false)) panels.panner.show();
+panels.refreshAll();
+
+// autosave (preference; desktop only — needs a real file path)
+setInterval(() => {
+  if (getPref(PREF_AUTOSAVE, false) && isTauri() && currentPath && editor.dirty) void doSave();
+}, 60_000);
 
 let lastMouse: [number, number] = [innerWidth / 2, innerHeight / 2];
 window.addEventListener("pointermove", (e) => (lastMouse = [e.clientX, e.clientY]));

@@ -9,8 +9,9 @@ import type { ActionMap } from "./actions";
 
 export const isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
 
-/** binding combo → action id */
-const BINDINGS: Record<string, string> = {
+/** binding combo → action id. Exported as the single source of truth for the
+ *  Help > Keyboard Shortcuts table — add a row here and the table updates. */
+export const BINDINGS: Record<string, string> = {
   "mod+o": "file.open",
   "mod+s": "file.save",
   "mod+shift+s": "file.saveAs",
@@ -47,6 +48,14 @@ const BINDINGS: Record<string, string> = {
   "mod+alt+c": "format.copyStyle",
   "mod+alt+v": "format.pasteStyle",
   "mod+1": "window.formatPalette",
+  "mod+2": "window.infoDock",
+  "mod+3": "window.contentDock", // stub until a content backend exists
+  // mod+4 intentionally unassigned (spec: keep the legacy numbering gap)
+  "mod+5": "window.layers",
+  "mod+6": "window.mapInfo",
+  "mod+7": "window.outline",
+  "mod+8": "window.panner",
+  "mod+9": "window.metaSearch",
   "alt+arrowup": "format.align.top",
   "alt+arrowdown": "format.align.bottom",
   "alt+arrowleft": "format.align.left",

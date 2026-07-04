@@ -3,9 +3,9 @@
 
 import {
   FONT_SIZES, GDoc, GFont, GItem, GLink, GNode, GResource, LinkEnd, NodeShape,
-  STROKE_DASHES, SELECTION_COLOR, deleteItems, docBounds, expandToGroups, getNode,
-  groupItems, hasStraightLinkBetween, isItemSelectable, isItemVisible, makeLink,
-  makeNode, newDoc, allocId, paintOrder, ungroupItems,
+  STROKE_DASHES, SELECTION_COLOR, deleteItems, docBounds, expandToGroups, getLayer,
+  getNode, groupItems, hasStraightLinkBetween, isItemSelectable, isItemVisible,
+  makeLink, makeNode, newDoc, allocId, paintOrder, pruneHiddenIds, ungroupItems,
 } from "../core/model";
 import {
   Pt, distSqToSegment, flattenLinkPath, linkMidpoint, nodeCenter, nodeOutline,
@@ -65,6 +65,12 @@ export class Editor {
   panX = 0;
   panY = 0;
   dirty = false;
+
+  // wave-3 view toggles: display-only state — not part of the doc, not undoable
+  showLinks = true;
+  showLinkLabels = true;
+  showPruning = true;
+  private pruneSet: ReadonlySet<string> = new Set(); // items hidden by prunes; refreshed each render
 
   private history = new History();
   private drag: Drag = { kind: "none" };
@@ -143,10 +149,12 @@ export class Editor {
     this.onChange();
   }
 
-  /** Run a mutation with an undo checkpoint. */
+  /** Run a mutation with an undo checkpoint. Selection ids that no longer
+   *  exist afterwards (deleted items, deleted layers' contents) are dropped. */
   mutate(fn: () => void): void {
     this.history.checkpoint(this.doc);
     fn();
+    this.pruneSelection();
     this.dirty = true;
     this.render();
     this.onChange();
@@ -255,6 +263,39 @@ export class Editor {
     this.setZoom(1);
   }
 
+  /** Standalone copy of the map SVG for the print/PDF pipeline (wave 4).
+   *  Only the items layer is cloned — selection chrome and drag overlays are
+   *  excluded. mode "fit" frames the whole map; "viewport" frames exactly what
+   *  is on screen right now. Returns null when there is nothing to frame. */
+  printableSvg(mode: "fit" | "viewport"): SVGSVGElement | null {
+    let box: { x: number; y: number; w: number; h: number };
+    if (mode === "fit") {
+      const b = docBounds(this.doc);
+      if (!b) return null;
+      box = { x: b.x - FIT_PAD, y: b.y - FIT_PAD, w: b.w + FIT_PAD * 2, h: b.h + FIT_PAD * 2 };
+    } else {
+      const r = this.svg.getBoundingClientRect();
+      if (r.width < 10 || r.height < 10) return null;
+      box = { x: -this.panX / this.zoom, y: -this.panY / this.zoom, w: r.width / this.zoom, h: r.height / this.zoom };
+    }
+    const out = el("svg") as SVGSVGElement;
+    out.setAttribute("viewBox", `${box.x} ${box.y} ${box.w} ${box.h}`);
+    out.setAttribute("preserveAspectRatio", "xMidYMid meet");
+    // non-white map backgrounds are user content — print them as a real rect
+    // (CSS backgrounds are skipped by printers by default)
+    if (this.doc.background && this.doc.background.toLowerCase() !== "#ffffff") {
+      const bg = el("rect");
+      bg.setAttribute("x", String(box.x));
+      bg.setAttribute("y", String(box.y));
+      bg.setAttribute("width", String(box.w));
+      bg.setAttribute("height", String(box.h));
+      bg.setAttribute("fill", this.doc.background);
+      out.appendChild(bg);
+    }
+    out.appendChild(this.itemsG.cloneNode(true) as SVGGElement);
+    return out;
+  }
+
   /** Fit the given map-coordinate rect into the viewport (zoom tool drag, zoom-to-selection). */
   zoomToRect(b: { x: number; y: number; w: number; h: number }): void {
     const r = this.svg.getBoundingClientRect();
@@ -295,6 +336,233 @@ export class Editor {
     return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
   }
 
+  // ---------- effective visibility (doc flags + view toggles + pruning) ----------
+
+  /** Doc-level visibility plus view-only state: prune chains and the global
+   *  link-display toggle. Use this (not isItemVisible) for anything on screen. */
+  itemVisible(it: GItem): boolean {
+    if (!isItemVisible(this.doc, it)) return false;
+    if (this.showPruning && this.pruneSet.has(it.id)) return false;
+    if (it.kind === "link" && !this.showLinks) return false;
+    return true;
+  }
+
+  itemSelectable(it: GItem): boolean {
+    return this.itemVisible(it) && isItemSelectable(this.doc, it);
+  }
+
+  // ---------- view toggles / hide / collapse / pruning (wave 3) ----------
+
+  toggleViewFlag(flag: "showLinks" | "showLinkLabels" | "showPruning"): void {
+    this[flag] = !this[flag];
+    this.render();
+    this.onViewChange();
+  }
+
+  anyHidden(): boolean {
+    return this.doc.items.some((i) => i.hidden);
+  }
+
+  /** Context-menu Hide: set the hidden flag on the selection (undoable) and deselect. */
+  hideSelection(): void {
+    const targets = this.selectedItems();
+    if (!targets.length) return;
+    this.mutate(() => {
+      for (const it of targets) it.hidden = true;
+    });
+    this.selection.clear();
+    this.render();
+  }
+
+  /** View > Show All Hidden: clear the hidden flag everywhere (undoable). */
+  showAllHidden(): void {
+    if (!this.anyHidden()) return;
+    this.mutate(() => {
+      for (const it of this.doc.items) it.hidden = false;
+    });
+  }
+
+  allNodesCollapsed(): boolean {
+    const ns = this.doc.items.filter((i) => i.kind === "node");
+    return ns.length > 0 && ns.every((n) => (n as GNode).collapsed);
+  }
+
+  /** View > Toggle Global Collapse: set every node's collapsed flag (undoable). */
+  setGlobalCollapse(collapsed: boolean): void {
+    this.mutate(() => {
+      for (const it of this.doc.items) if (it.kind === "node") it.collapsed = collapsed;
+    });
+  }
+
+  /** Per-node collapse toggle; target state is the inverse of the first selected node's. */
+  toggleCollapseSelection(): void {
+    const ns = this.selectedNodes();
+    if (!ns.length) return;
+    const target = !ns[0].collapsed;
+    this.mutate(() => {
+      for (const n of ns) n.collapsed = target;
+    });
+  }
+
+  anyPruned(): boolean {
+    return this.doc.items.some((i) => i.kind === "link" && (i.headPruned || i.tailPruned));
+  }
+
+  /** View > Clear All Pruning (undoable; legacy clearAllPruneStates). */
+  clearAllPruning(): void {
+    if (!this.anyPruned()) return;
+    this.mutate(() => {
+      for (const it of this.doc.items) {
+        if (it.kind === "link") {
+          it.headPruned = false;
+          it.tailPruned = false;
+        }
+      }
+    });
+  }
+
+  /** The single selected link, if the selection is exactly one link. */
+  singleSelectedLink(): GLink | undefined {
+    if (this.selection.size !== 1) return undefined;
+    const it = this.selectedItems()[0];
+    return it && it.kind === "link" ? it : undefined;
+  }
+
+  /** True when the branch on the given side of the single selected link is
+   *  prune-hidden. NOTE the legacy field cross-mapping: hiding the HEAD-side
+   *  chain is persisted as tailPruned (dot at the surviving tail end), and
+   *  vice versa — see pruneHiddenIds in core/model.ts. */
+  isSidePruned(side: "head" | "tail"): boolean {
+    const l = this.singleSelectedLink();
+    if (!l) return false;
+    return side === "head" ? l.tailPruned : l.headPruned;
+  }
+
+  canPruneSide(side: "head" | "tail"): boolean {
+    const l = this.singleSelectedLink();
+    if (!l) return false;
+    // the side being hidden must actually have a node chain to hide
+    return (side === "head" ? l.head.node : l.tail.node) != null;
+  }
+
+  /** Toggle pruning of the branch reachable through the given endpoint (undoable). */
+  togglePruneSide(side: "head" | "tail"): void {
+    const l = this.singleSelectedLink();
+    if (!l || !this.canPruneSide(side)) return;
+    const field = side === "head" ? "tailPruned" : "headPruned"; // legacy cross-mapping
+    this.mutate(() => {
+      l[field] = !l[field];
+    });
+  }
+
+  /** Map background color with undo (Format / Map Info swatch). */
+  setBackground(color: string): void {
+    if (this.doc.background === color) return;
+    this.mutate(() => {
+      this.doc.background = color;
+    });
+  }
+
+  // ---------- layers (wave 3 panel support) ----------
+
+  /** Switch the active layer. Doc state (saved in the file, marks dirty) but
+   *  deliberately NOT an undo checkpoint — clicking around the layers panel
+   *  shouldn't pollute the undo history. Undo of real mutations restores it
+   *  anyway, since history snapshots the whole doc. */
+  activateLayer(id: string): void {
+    if (this.doc.activeLayer === id || !getLayer(this.doc, id)) return;
+    this.doc.activeLayer = id;
+    this.dirty = true;
+    this.render();
+    this.onChange();
+  }
+
+  // ---------- navigation helpers (outline / search / panner) ----------
+
+  /** Rough center of an item in map coordinates. */
+  itemCenterOf(it: GItem): Pt {
+    if (it.kind === "node") return nodeCenter(it);
+    return { x: (it.head.x + it.tail.x) / 2, y: (it.head.y + it.tail.y) / 2 };
+  }
+
+  /** Scroll the item into view; `center` forces re-centering even when visible. */
+  revealItem(id: string, center = false): void {
+    const it = this.doc.items.find((i) => i.id === id);
+    if (!it) return;
+    const r = this.svg.getBoundingClientRect();
+    const c = this.itemCenterOf(it);
+    const sx = c.x * this.zoom + this.panX;
+    const sy = c.y * this.zoom + this.panY;
+    const off = sx < 0 || sy < 0 || sx > r.width || sy > r.height;
+    if (!center && !off) return;
+    this.panX = r.width / 2 - c.x * this.zoom;
+    this.panY = r.height / 2 - c.y * this.zoom;
+    this.render();
+    this.onViewChange();
+  }
+
+  /** Zoom the viewport to a single item (outline double-click). */
+  zoomToItem(id: string): void {
+    const it = this.doc.items.find((i) => i.id === id);
+    if (!it) return;
+    let b: { x: number; y: number; w: number; h: number };
+    if (it.kind === "node") b = { x: it.x - 20, y: it.y - 20, w: it.w + 40, h: it.h + 40 };
+    else {
+      const x0 = Math.min(it.head.x, it.tail.x) - 30;
+      const y0 = Math.min(it.head.y, it.tail.y) - 30;
+      b = {
+        x: x0,
+        y: y0,
+        w: Math.abs(it.head.x - it.tail.x) + 60,
+        h: Math.abs(it.head.y - it.tail.y) + 60,
+      };
+    }
+    // cap so a tiny item doesn't zoom in absurdly far
+    const r = this.svg.getBoundingClientRect();
+    const z = Math.min((r.width - FIT_PAD * 2) / Math.max(b.w, 1), (r.height - FIT_PAD * 2) / Math.max(b.h, 1), 2);
+    this.zoom = Math.max(0.001, z);
+    this.panX = (r.width - b.w * this.zoom) / 2 - b.x * this.zoom;
+    this.panY = (r.height - b.h * this.zoom) / 2 - b.y * this.zoom;
+    this.render();
+    this.onViewChange();
+  }
+
+  /** Center the viewport on a map point (panner drag). */
+  centerWorld(wx: number, wy: number): void {
+    const r = this.svg.getBoundingClientRect();
+    this.panX = r.width / 2 - wx * this.zoom;
+    this.panY = r.height / 2 - wy * this.zoom;
+    this.render();
+    this.onViewChange();
+  }
+
+  /** Current viewport in map coordinates (panner rectangle). */
+  viewportWorld(): { x: number; y: number; w: number; h: number } {
+    const r = this.svg.getBoundingClientRect();
+    return {
+      x: -this.panX / this.zoom,
+      y: -this.panY / this.zoom,
+      w: r.width / this.zoom,
+      h: r.height / this.zoom,
+    };
+  }
+
+  /** Rename an item from a panel (same auto-size rule as the inline editor). */
+  setLabel(id: string, label: string): void {
+    const it = this.doc.items.find((i) => i.id === id);
+    if (!it || it.label === label) return;
+    this.mutate(() => {
+      it.label = label;
+      if (it.kind === "node" && it.autoSized) {
+        const size = autoSizeFor(label, it.font);
+        const cx = it.x + it.w / 2;
+        it.w = size.w;
+        it.h = size.h;
+        it.x = cx - size.w / 2;
+      }
+    });
+  }
+
   // ---------- editing operations ----------
 
   deleteSelection(): void {
@@ -319,7 +587,7 @@ export class Editor {
 
   selectAll(): void {
     for (const it of this.doc.items) {
-      if (isItemSelectable(this.doc, it)) this.selection.add(it.id);
+      if (this.itemSelectable(it)) this.selection.add(it.id);
     }
     this.render();
   }
@@ -327,7 +595,7 @@ export class Editor {
   selectAllNodes(): void {
     this.selection.clear();
     for (const it of this.doc.items) {
-      if (it.kind === "node" && isItemSelectable(this.doc, it)) this.selection.add(it.id);
+      if (it.kind === "node" && this.itemSelectable(it)) this.selection.add(it.id);
     }
     this.render();
   }
@@ -335,7 +603,7 @@ export class Editor {
   selectAllLinks(): void {
     this.selection.clear();
     for (const it of this.doc.items) {
-      if (it.kind === "link" && isItemSelectable(this.doc, it)) this.selection.add(it.id);
+      if (it.kind === "link" && this.itemSelectable(it)) this.selection.add(it.id);
     }
     this.render();
   }
@@ -379,7 +647,7 @@ export class Editor {
     }
     for (const id of add) {
       const it = this.doc.items.find((i) => i.id === id);
-      if (it && isItemSelectable(this.doc, it)) this.selection.add(id);
+      if (it && this.itemSelectable(it)) this.selection.add(id);
     }
     this.selection = expandToGroups(this.doc, this.selection);
     this.render();
@@ -529,7 +797,7 @@ export class Editor {
       const otherId =
         it.head.node === from.id ? it.tail.node : it.tail.node === from.id ? it.head.node : null;
       const other = getNode(this.doc, otherId);
-      if (!other || !isItemSelectable(this.doc, other)) continue;
+      if (!other || !this.itemSelectable(other)) continue;
       const c1 = nodeCenter(other);
       const dx = c1.x - c0.x, dy = c1.y - c0.y;
       const along =
@@ -851,7 +1119,7 @@ export class Editor {
     const order = paintOrder(this.doc);
     for (let i = order.length - 1; i >= 0; i--) {
       const it = order[i];
-      if (!isItemSelectable(this.doc, it)) continue;
+      if (!this.itemSelectable(it)) continue;
       if (it.kind === "node") {
         if (w.x < it.x - slop || w.x > it.x + it.w + slop || w.y < it.y - slop || w.y > it.y + it.h + slop) continue;
         if (pointInOutline(w, nodeOutline(it))) return it;
@@ -862,7 +1130,7 @@ export class Editor {
         }
       } else {
         const g = this.linkGeometry(it);
-        if (it.headPruned || it.tailPruned) {
+        if (this.showPruning && (it.headPruned || it.tailPruned)) {
           // pruned link renders as a dot only; only the dot is hittable
           const r = Math.max(PRUNE_DOT_SIZE / 2, slop);
           for (const q of prunedDotPoints(it, g.headPt, g.tailPt)) {
@@ -874,7 +1142,7 @@ export class Editor {
         for (let j = 0; j < g.flat.length - 1; j++) {
           if (distSqToSegment(w, g.flat[j], g.flat[j + 1]) <= r * r) return it;
         }
-        if (it.label) {
+        if (it.label && this.showLinkLabels) {
           const m = measureLabel(it.label, it.font);
           if (Math.abs(w.x - g.mid.x) <= m.w / 2 + 3 && Math.abs(w.y - g.mid.y) <= m.h / 2 + 2) return it;
         }
@@ -1454,12 +1722,12 @@ export class Editor {
   private itemsInRect(r: { x: number; y: number; w: number; h: number }): string[] {
     const out: string[] = [];
     for (const it of this.doc.items) {
-      if (!isItemSelectable(this.doc, it)) continue;
+      if (!this.itemSelectable(it)) continue;
       if (it.kind === "node") {
         if (it.x < r.x + r.w && it.x + it.w > r.x && it.y < r.y + r.h && it.y + it.h > r.y) out.push(it.id);
       } else {
         const g = this.linkGeometry(it);
-        if (it.headPruned || it.tailPruned) {
+        if (this.showPruning && (it.headPruned || it.tailPruned)) {
           for (const q of prunedDotPoints(it, g.headPt, g.tailPt)) {
             if (q.x >= r.x && q.x <= r.x + r.w && q.y >= r.y && q.y <= r.y + r.h) {
               out.push(it.id);
@@ -1527,13 +1795,14 @@ export class Editor {
   // ---------- rendering ----------
 
   render(): void {
+    this.pruneSet = this.showPruning ? pruneHiddenIds(this.doc) : EMPTY_SET;
     this.svg.style.background = this.doc.background;
     this.world.setAttribute("transform", `translate(${this.panX},${this.panY}) scale(${this.zoom})`);
     this.itemsG.replaceChildren();
     this.overlayG.replaceChildren();
 
     for (const it of paintOrder(this.doc)) {
-      if (!isItemVisible(this.doc, it)) continue;
+      if (!this.itemVisible(it)) continue;
       if (it.kind === "node") this.renderNode(it);
       else this.renderLink(it);
     }
@@ -1567,8 +1836,9 @@ export class Editor {
     const geo = this.linkGeometry(l);
     const g = el("g");
 
-    // pruned link: no line/arrows/label, just a ~7px dot at the surviving endpoint
-    if (l.headPruned || l.tailPruned) {
+    // pruned link: no line/arrows/label, just a ~7px stub dot at the pruned end,
+    // adjacent to the surviving node (legacy drawPruned)
+    if (this.showPruning && (l.headPruned || l.tailPruned)) {
       for (const q of prunedDotPoints(l, geo.headPt, geo.tailPt)) {
         const dot = el("circle");
         dot.setAttribute("cx", String(q.x));
@@ -1602,7 +1872,7 @@ export class Editor {
     if (l.arrowState & 1) g.appendChild(this.arrowHead(geo.headPt, geo.ctrl0 ?? geo.tailPt, l));
     if (l.arrowState & 2) g.appendChild(this.arrowHead(geo.tailPt, geo.ctrl1 ?? geo.ctrl0 ?? geo.headPt, l));
 
-    if (l.label && this.editingId !== l.id) {
+    if (l.label && this.showLinkLabels && this.editingId !== l.id) {
       const m = measureLabel(l.label, l.font);
       const bg = el("rect");
       bg.setAttribute("x", String(geo.mid.x - m.w / 2 - 2));
@@ -1678,7 +1948,7 @@ export class Editor {
     // selection chrome
     for (const id of this.selection) {
       const it = this.doc.items.find((i) => i.id === id);
-      if (!it || !isItemVisible(this.doc, it)) continue;
+      if (!it || !this.itemVisible(it)) continue;
       if (it.kind === "node") {
         const outline = el("path");
         outline.setAttribute("d", shapePathData(it.shape, it.x, it.y, it.w, it.h));
@@ -1812,13 +2082,15 @@ export class Editor {
 
 const PRUNE_DOT_SIZE = 7; // legacy LWLink.PruneDotSize
 
-/** Dot location(s) for a pruned link: the surviving (unpruned) endpoint; both when
- *  both ends are pruned. */
+/** Dot location(s) for a pruned link: at each pruned end, which sits next to
+ *  the surviving node (legacy drawPruned draws the dot at the pruning End). */
 function prunedDotPoints(l: GLink, headPt: Pt, tailPt: Pt): Pt[] {
-  if (l.headPruned && !l.tailPruned) return [tailPt];
-  if (l.tailPruned && !l.headPruned) return [headPt];
+  if (l.headPruned && !l.tailPruned) return [headPt];
+  if (l.tailPruned && !l.headPruned) return [tailPt];
   return [headPt, tailPt];
 }
+
+const EMPTY_SET: ReadonlySet<string> = new Set();
 
 function el(name: string): SVGElement {
   return document.createElementNS("http://www.w3.org/2000/svg", name);

@@ -5,6 +5,12 @@ import { ActionMap } from "./actions";
 import { MenuEntry, anyMenuOpen, closeAllMenus, openRootMenu } from "./menu";
 import { SHAPE_ORDER } from "./palette";
 import { Editor } from "./editor";
+import { isTauri } from "./platform";
+
+/** Shortened path for the Recently Opened submenu. */
+function displayPath(p: string): string {
+  return p.length > 44 ? "…" + p.slice(-43) : p;
+}
 
 const sep: MenuEntry = { sep: true };
 
@@ -81,7 +87,24 @@ function alignSub(editor: Editor): MenuEntry {
 
 export { shapeSub, lineSub, arrowSub, fontSub, imageSub, alignSub };
 
-export function installMenuBar(container: HTMLElement, actions: ActionMap, editor: Editor): void {
+export function installMenuBar(
+  container: HTMLElement,
+  actions: ActionMap,
+  editor: Editor,
+  recentFiles: () => string[],
+): void {
+  // Recently Opened: Tauri-only (browser files have no reopenable path)
+  const recentEntries = (): MenuEntry[] =>
+    isTauri()
+      ? [
+          {
+            label: "Recently Opened",
+            sub: recentFiles().map((p, i) => ({ id: `file.recent.${i}`, label: displayPath(p) })),
+            enabled: () => recentFiles().length > 0,
+          },
+        ]
+      : [];
+
   const menus: { title: string; entries: () => MenuEntry[] }[] = [
     {
       title: "File",
@@ -100,7 +123,7 @@ export function installMenuBar(container: HTMLElement, actions: ActionMap, edito
         { id: "file.printVisible" },
         { id: "file.exportPdf" },
         { id: "file.exportVue" },
-        { id: "file.recent" },
+        ...recentEntries(),
         sep,
         { id: "file.exit" },
       ],
@@ -149,6 +172,8 @@ export function installMenuBar(container: HTMLElement, actions: ActionMap, edito
         { id: "view.clearPruning" },
         { id: "view.toggleLinks" },
         { id: "view.toggleLinkLabels" },
+        sep,
+        { id: "view.showAllHidden" },
       ],
     },
     {

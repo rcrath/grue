@@ -3,7 +3,7 @@
 // item delegates to the shared action registry.
 
 import { ActionMap, isImageResource } from "./actions";
-import { GItem } from "../core/model";
+import { GItem, GLink, getNode } from "../core/model";
 import { Editor } from "./editor";
 import { MenuEntry, openRootMenu } from "./menu";
 import { alignSub, arrowSub, fontSub, imageSub, lineSub, shapeSub } from "./menubar";
@@ -58,11 +58,29 @@ function nodeMenu(editor: Editor, node: GItem): MenuEntry[] {
     ...resourceEntries(node),
     { id: "content.notes" },
     sep,
+    { id: "item.collapse" },
+    { id: "item.hide" },
+    sep,
     ...editBlock,
   ];
 }
 
-function linkMenu(editor: Editor, link: GItem): MenuEntry[] {
+/** Per-endpoint prune commands, labeled with the endpoint node's name when it
+ *  has one. "Prune X Side" hides everything reachable through that endpoint
+ *  (legacy LWLink chain semantics — see core/model.ts pruneHiddenIds). */
+function pruneEntries(editor: Editor, link: GLink): MenuEntry[] {
+  const name = (id: string | null, fallback: string) => {
+    const label = getNode(editor.doc, id)?.label.trim();
+    if (!label) return fallback;
+    return label.length > 14 ? label.slice(0, 13) + "…" : label;
+  };
+  return [
+    { id: "link.pruneHead", label: `Prune ${name(link.head.node, "Head")} Side` },
+    { id: "link.pruneTail", label: `Prune ${name(link.tail.node, "Tail")} Side` },
+  ];
+}
+
+function linkMenu(editor: Editor, link: GLink): MenuEntry[] {
   return [
     { id: "format.copyStyle" },
     { id: "format.pasteStyle" },
@@ -72,6 +90,9 @@ function linkMenu(editor: Editor, link: GItem): MenuEntry[] {
     sep,
     ...resourceEntries(link),
     { id: "content.notes" },
+    sep,
+    ...pruneEntries(editor, link),
+    { id: "item.hide" },
     sep,
     ...editBlock,
   ];
@@ -119,6 +140,8 @@ function multiMenu(editor: Editor): MenuEntry[] {
     sep,
     { id: "edit.group" },
     { id: "edit.ungroup" },
+    sep,
+    { id: "item.hide" },
     sep,
     ...editBlock,
   ];

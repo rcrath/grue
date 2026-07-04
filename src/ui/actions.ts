@@ -6,8 +6,12 @@ import { GResource, NodeShape } from "../core/model";
 import { AlignMode, Editor } from "./editor";
 import { promptText, openNotesEditor } from "./dialogs";
 import { pickFilePath } from "./platform";
-import { FormatPalette, SHAPE_ORDER, SHAPE_LABELS } from "./palette";
+import { SHAPE_ORDER, SHAPE_LABELS, openSwatchPopup } from "./palette";
+import { PanelSet } from "./panels";
+import { openPreferences } from "./preferences";
 import { keyLabel } from "./shortcuts";
+import { printMap } from "./print";
+import { GUIDE_URL, openAbout, openExternal, openShortcutTable } from "./help";
 
 export interface AppAction {
   label: string;
@@ -28,9 +32,13 @@ export interface FileOps {
   revert(): void;
   canRevert(): boolean;
   newMap(): void;
+  closeMap(): void;
   exportVue(): void;
   exit(): void;
   newNodeAtCursor(): void;
+  /** Recently opened/saved file paths, newest first (Tauri only; empty in a browser). */
+  recentFiles(): string[];
+  openRecent(index: number): void;
 }
 
 /** True when a resource points at an image file (spec-open-question reading:
@@ -41,7 +49,7 @@ export function isImageResource(r: GResource | null): boolean {
   return /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(spec);
 }
 
-export function buildActions(editor: Editor, file: FileOps, palette: FormatPalette): ActionMap {
+export function buildActions(editor: Editor, file: FileOps, panels: PanelSet): ActionMap {
   const m: ActionMap = new Map();
   const add = (id: string, a: AppAction) => m.set(id, a);
   const stub = (id: string, label: string, shortcut?: string) =>
@@ -62,11 +70,19 @@ export function buildActions(editor: Editor, file: FileOps, palette: FormatPalet
   add("file.revert", { label: "Revert", enabled: file.canRevert, run: file.revert });
   // spec marks New Map W3, but wave-1 reality already ships a working new-map — reality wins
   add("file.new", { label: "New Map", enabled: () => true, run: file.newMap });
-  stub("file.close", "Close Map", keyLabel("mod+w"));
-  stub("file.print", "Print…", keyLabel("mod+p"));
-  stub("file.printVisible", "Print Visible");
-  stub("file.exportPdf", "Export PDF…");
-  stub("file.recent", "Recently Opened");
+  add("file.close", { label: "Close Map", shortcut: keyLabel("mod+w"), enabled: () => true, run: file.closeMap });
+  const printable = () => editor.doc.items.length > 0;
+  add("file.print", { label: "Print…", shortcut: keyLabel("mod+p"), enabled: printable, run: () => printMap(editor, "fit"), tooltip: "Print the whole map, fitted to the page" });
+  add("file.printVisible", { label: "Print Visible", enabled: printable, run: () => printMap(editor, "viewport"), tooltip: "Print the current view as-is" });
+  add("file.exportPdf", { label: "Export PDF (via Print…)", enabled: printable, run: () => printMap(editor, "fit"), tooltip: "Opens the print dialog — choose “Save as PDF” there" });
+  // Recently Opened submenu entries (the File menu builds labels from the list)
+  for (let i = 0; i < 8; i++) {
+    add(`file.recent.${i}`, {
+      label: `Recent ${i + 1}`,
+      enabled: () => file.recentFiles().length > i,
+      run: () => file.openRecent(i),
+    });
+  }
   add("file.exportVue", { label: "Export .vue…", enabled: () => true, run: file.exportVue });
   add("file.exit", { label: "Exit", shortcut: keyLabel("mod+q"), enabled: () => true, run: file.exit });
 
@@ -88,7 +104,12 @@ export function buildActions(editor: Editor, file: FileOps, palette: FormatPalet
   add("edit.shrinkSelection", { label: "Shrink Selection", shortcut: keyLabel("mod+shift+["), enabled: () => editor.canShrinkSelection(), run: () => editor.shrinkSelection() });
   add("edit.group", { label: "Group", shortcut: keyLabel("mod+g"), enabled: () => editor.canGroup(), run: () => editor.groupSelection() });
   add("edit.ungroup", { label: "Ungroup", shortcut: keyLabel("mod+shift+g"), enabled: () => editor.selectionHasGroup(), run: () => editor.ungroupSelection() });
-  stub("edit.preferences", "Preferences…", keyLabel("mod+,"));
+  add("edit.preferences", {
+    label: "Preferences…",
+    shortcut: keyLabel("mod+,"),
+    enabled: () => true,
+    run: () => openPreferences(editor),
+  });
   add("edit.newNodeAtCursor", { label: "New Node", shortcut: keyLabel("mod+n"), enabled: () => true, run: file.newNodeAtCursor });
 
   // ---------- View ----------
@@ -107,11 +128,71 @@ export function buildActions(editor: Editor, file: FileOps, palette: FormatPalet
       else void document.documentElement.requestFullscreen();
     },
   });
-  stub("view.globalCollapse", "Toggle Global Collapse");
-  stub("view.pruning", "Toggle Pruning");
-  stub("view.clearPruning", "Clear All Pruning");
-  stub("view.toggleLinks", "Toggle Links");
-  stub("view.toggleLinkLabels", "Toggle Link Labels");
+  add("view.globalCollapse", {
+    label: "Toggle Global Collapse",
+    enabled: () => editor.doc.items.some((i) => i.kind === "node"),
+    checked: () => editor.allNodesCollapsed(),
+    run: () => editor.setGlobalCollapse(!editor.allNodesCollapsed()),
+  });
+  add("view.pruning", {
+    label: "Toggle Pruning",
+    enabled: () => true,
+    checked: () => editor.showPruning,
+    run: () => editor.toggleViewFlag("showPruning"),
+    tooltip: "Show/hide the effect of pruned links (display only)",
+  });
+  add("view.clearPruning", {
+    label: "Clear All Pruning",
+    enabled: () => editor.anyPruned(),
+    run: () => editor.clearAllPruning(),
+  });
+  add("view.toggleLinks", {
+    label: "Toggle Links",
+    enabled: () => true,
+    checked: () => editor.showLinks,
+    run: () => editor.toggleViewFlag("showLinks"),
+  });
+  add("view.toggleLinkLabels", {
+    label: "Toggle Link Labels",
+    enabled: () => true,
+    checked: () => editor.showLinkLabels,
+    run: () => editor.toggleViewFlag("showLinkLabels"),
+  });
+  add("view.showAllHidden", {
+    label: "Show All Hidden",
+    enabled: () => editor.anyHidden(),
+    run: () => editor.showAllHidden(),
+  });
+
+  // ---------- per-item hide / collapse / prune (context menus) ----------
+  add("item.hide", {
+    label: "Hide",
+    enabled: () => sel() > 0,
+    run: () => editor.hideSelection(),
+    tooltip: "Hide the selection (View > Show All Hidden brings it back)",
+  });
+  add("item.collapse", {
+    label: "Collapse",
+    enabled: hasNodesSelected,
+    checked: () => hasNodesSelected() && editor.selectedNodes().every((n) => n.collapsed),
+    run: () => editor.toggleCollapseSelection(),
+  });
+  // NOTE legacy field cross-mapping (see core/model.ts pruneHiddenIds): hiding
+  // the head-side chain is persisted as tailPruned, and vice versa.
+  add("link.pruneHead", {
+    label: "Prune Head Side",
+    enabled: () => editor.canPruneSide("head"),
+    checked: () => editor.isSidePruned("head"),
+    run: () => editor.togglePruneSide("head"),
+    tooltip: "Hide everything reachable through this link's head end",
+  });
+  add("link.pruneTail", {
+    label: "Prune Tail Side",
+    enabled: () => editor.canPruneSide("tail"),
+    checked: () => editor.isSidePruned("tail"),
+    run: () => editor.togglePruneSide("tail"),
+    tooltip: "Hide everything reachable through this link's tail end",
+  });
 
   // ---------- Format ----------
   add("format.copyStyle", { label: "Copy Style", shortcut: keyLabel("mod+alt+c"), enabled: () => sel() > 0, run: () => editor.copyStyle() });
@@ -225,29 +306,49 @@ export function buildActions(editor: Editor, file: FileOps, palette: FormatPalet
   });
 
   // ---------- Window ----------
-  add("window.formatPalette", {
-    label: "Format Palette",
-    shortcut: keyLabel("mod+1"),
-    enabled: () => true,
-    checked: () => palette.isOpen(),
-    run: () => palette.toggle(),
+  const panelAction = (id: string, label: string, panel: { isOpen(): boolean; toggle(): void }, key: string) =>
+    add(id, {
+      label,
+      shortcut: keyLabel(key),
+      enabled: () => true,
+      checked: () => panel.isOpen(),
+      run: () => panel.toggle(),
+    });
+  panelAction("window.formatPalette", "Format Palette", panels.palette, "mod+1");
+  panelAction("window.infoDock", "Info", panels.info, "mod+2");
+  stub("window.contentDock", "Content Dock", keyLabel("mod+3")); // resources/datasets backends don't exist yet
+  panelAction("window.layers", "Layers", panels.layers, "mod+5");
+  panelAction("window.mapInfo", "Map Info", panels.mapInfo, "mod+6");
+  panelAction("window.outline", "Outline", panels.outline, "mod+7");
+  panelAction("window.panner", "Panner", panels.panner, "mod+8");
+  panelAction("window.metaSearch", "Search", panels.search, "mod+9");
+  // permanently N/A: the full-screen toolbar was an artifact of legacy
+  // presentation mode, which grue dropped — kept visible so the menu shape
+  // matches the spec, but it will never be wired up
+  add("window.fsToolbar", {
+    label: "Full Screen Toolbar",
+    enabled: () => false,
+    run: () => {},
+    tooltip: "not applicable — legacy presentation-mode feature, dropped in grue",
   });
-  stub("window.infoDock", "Info Dock", keyLabel("mod+2"));
-  stub("window.contentDock", "Content Dock", keyLabel("mod+3"));
-  stub("window.layers", "Layers", keyLabel("mod+5"));
-  stub("window.mapInfo", "Map Info", keyLabel("mod+6"));
-  stub("window.outline", "Outline", keyLabel("mod+7"));
-  stub("window.panner", "Panner", keyLabel("mod+8"));
-  stub("window.metaSearch", "Metadata Search", keyLabel("mod+9"));
-  stub("window.fsToolbar", "Full Screen Toolbar", keyLabel("mod+0"));
-  stub("window.gather", "Gather Windows");
-  stub("window.mapBackground", "Map Background Color…");
+  add("window.gather", { label: "Gather Windows", enabled: () => true, run: () => panels.gather() });
+  add("window.mapBackground", {
+    label: "Map Background Color…",
+    enabled: () => true,
+    run: () =>
+      openSwatchPopup({ x: innerWidth / 2 - 90, y: 120 }, (c) => editor.setBackground(c ?? "#ffffff")),
+  });
 
-  // ---------- Help (entire menu is W4) ----------
-  stub("help.about", "About");
-  stub("help.guide", "User Guide");
+  // ---------- Help (wave 4) ----------
+  add("help.about", { label: "About grue", enabled: () => true, run: openAbout });
+  add("help.guide", {
+    label: "User Guide",
+    enabled: () => true,
+    run: () => openExternal(GUIDE_URL),
+    tooltip: "Opens the README on GitHub",
+  });
   stub("help.feedback", "Feedback");
-  stub("help.shortcuts", "Keyboard Shortcuts…");
+  add("help.shortcuts", { label: "Keyboard Shortcuts…", enabled: () => true, run: () => openShortcutTable(m) });
   stub("help.showLog", "Show Log");
 
   // ---------- keyboard-only (no menu entry) ----------

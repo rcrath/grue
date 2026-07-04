@@ -64,9 +64,14 @@ converted to `rgba()` on load); `null` fill = transparent.
       "textColor": "#404040",
       "font": { "family": "Arial", "size": 11, "bold": false, "italic": false, "underline": false },
       "hidden": false,
-      "headPruned": false,          // per-endpoint prune state (legacy headUserPruned);
-      "tailPruned": false,          //   a pruned link renders as a ~7px dot at the
-                                    //   surviving endpoint
+      "headPruned": false,          // legacy headUserPruned: hides everything reachable
+      "tailPruned": false,          //   from the TAIL node without passing through the
+                                    //   head node (head side survives; the link renders
+                                    //   as a ~7px stub dot at the head end, next to the
+                                    //   surviving node). tailPruned is the mirror image.
+                                    //   Whether prunes take effect on screen is a
+                                    //   view-only toggle (View > Toggle Pruning), not
+                                    //   part of the file.
       "layer": "1",
       "notes": "",
       "resource": null

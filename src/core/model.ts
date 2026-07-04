@@ -419,6 +419,59 @@ export function deleteItems(doc: GDoc, ids: Set<string>): void {
   doc.groups = doc.groups.filter((g) => g.members.length >= 2);
 }
 
+// ---- pruning (legacy LWLink semantics) ----
+
+/** Item ids hidden by user prunes, per legacy LWLink semantics:
+ *  a link with `headPruned` hides everything reachable from its TAIL node
+ *  without passing through its HEAD node — the head side survives and the link
+ *  renders as a stub dot at the head end (legacy setHeadUserPruned →
+ *  pruneToggle(getEndpointChain(tail.node)), backstop = head.node).
+ *  `tailPruned` is the mirror image. The pruning link itself is never hidden,
+ *  and traversal stops at (but still hides) other links pruned at the node
+ *  being walked (legacy LWComponent.getLinkChain / LWLink.isPrunedBelow). */
+export function pruneHiddenIds(doc: GDoc): Set<string> {
+  const allLinks = links(doc);
+  const hidden = new Set<string>();
+  if (!allLinks.some((l) => l.headPruned || l.tailPruned)) return hidden;
+
+  const byNode = new Map<string, GLink[]>();
+  for (const l of allLinks) {
+    for (const nid of [l.head.node, l.tail.node]) {
+      if (nid == null) continue;
+      let arr = byNode.get(nid);
+      if (!arr) byNode.set(nid, (arr = []));
+      arr.push(l);
+    }
+  }
+
+  const walk = (source: GLink, start: string | null, backstop: string | null) => {
+    if (start == null) return;
+    const bag = new Set<string>([start]);
+    const queue = [start];
+    while (queue.length) {
+      const nid = queue.pop()!;
+      for (const l of byNode.get(nid) ?? []) {
+        if (l.id === source.id) continue; // never hide the pruning link itself
+        bag.add(l.id);
+        // a link pruned at this end is included but not walked through (legacy isPrunedBelow)
+        const prunedHere = (l.head.node === nid && l.headPruned) || (l.tail.node === nid && l.tailPruned);
+        if (prunedHere) continue;
+        const other = l.head.node === nid ? l.tail.node : l.head.node;
+        if (other == null || other === backstop || bag.has(other)) continue;
+        bag.add(other);
+        queue.push(other);
+      }
+    }
+    for (const id of bag) hidden.add(id);
+  };
+
+  for (const l of allLinks) {
+    if (l.headPruned) walk(l, l.tail.node, l.head.node);
+    if (l.tailPruned) walk(l, l.head.node, l.tail.node);
+  }
+  return hidden;
+}
+
 /** Bounding box of all items (nodes + link points), or null when empty. */
 export function docBounds(doc: GDoc): { x: number; y: number; w: number; h: number } | null {
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;

@@ -4,6 +4,7 @@
 import { FONT_SIZES, NodeShape, PALETTE_COLORS, STROKE_WIDTHS } from "../core/model";
 import { shapePathData } from "../core/geometry";
 import { Editor } from "./editor";
+import { FloatingPanel } from "./panel";
 
 /** Legacy picker order (nodeModeTool.subtool.* — pentagon intentionally absent). */
 export const SHAPE_ORDER: NodeShape[] = [
@@ -42,44 +43,24 @@ const LINE_OPTIONS: { count: 0 | 1 | 2; label: string; title: string }[] = [
   { count: 2, label: "s-curve", title: "S-curved" },
 ];
 
-export class FormatPalette {
-  private root: HTMLElement;
+export class FormatPalette extends FloatingPanel {
   private editor: Editor;
-  private visible = false;
   private sig = "";
 
-  onToggle: () => void = () => {};
-
   constructor(editor: Editor) {
+    super({
+      key: "format",
+      title: "Format",
+      className: "palette",
+      closeHint: "Close (Ctrl+1)",
+      defaultPos: { top: 96, right: 14 },
+    });
     this.editor = editor;
-    this.root = document.createElement("div");
-    this.root.className = "palette";
-    this.root.style.display = "none";
     this.build();
-    document.body.appendChild(this.root);
-    editor.onRender = () => this.refresh();
   }
 
-  isOpen(): boolean {
-    return this.visible;
-  }
-
-  toggle(): void {
-    this.visible ? this.hide() : this.show();
-  }
-
-  show(): void {
-    this.visible = true;
-    this.root.style.display = "";
-    this.sig = "";
-    this.refresh();
-    this.onToggle();
-  }
-
-  hide(): void {
-    this.visible = false;
-    this.root.style.display = "none";
-    this.onToggle();
+  protected onShow(): void {
+    this.sig = ""; // force a rebuild of the section state
   }
 
   // ---- DOM ----
@@ -106,13 +87,6 @@ export class FormatPalette {
   private textColorBtn!: HTMLButtonElement;
 
   private build(): void {
-    const head = document.createElement("div");
-    head.className = "palette-head";
-    head.innerHTML = `<span>Format</span><button class="palette-close" title="Close (Ctrl+1)">✕</button>`;
-    (head.querySelector(".palette-close") as HTMLButtonElement).addEventListener("click", () => this.hide());
-    this.makeDraggable(head);
-    this.root.appendChild(head);
-
     this.emptyHint = document.createElement("div");
     this.emptyHint.className = "pal-hint";
     this.emptyHint.textContent = "Select nodes or links to edit their style.";
@@ -286,30 +260,10 @@ export class FormatPalette {
     return sel;
   }
 
-  private makeDraggable(head: HTMLElement): void {
-    head.addEventListener("pointerdown", (e) => {
-      if ((e.target as HTMLElement).tagName === "BUTTON") return;
-      const r = this.root.getBoundingClientRect();
-      const offX = e.clientX - r.left, offY = e.clientY - r.top;
-      const move = (ev: PointerEvent) => {
-        this.root.style.left = `${Math.max(0, Math.min(innerWidth - 60, ev.clientX - offX))}px`;
-        this.root.style.top = `${Math.max(0, Math.min(innerHeight - 40, ev.clientY - offY))}px`;
-        this.root.style.right = "auto";
-      };
-      const up = () => {
-        window.removeEventListener("pointermove", move);
-        window.removeEventListener("pointerup", up);
-      };
-      window.addEventListener("pointermove", move);
-      window.addEventListener("pointerup", up);
-      e.preventDefault();
-    });
-  }
-
   // ---- state sync ----
 
   refresh(): void {
-    if (!this.visible) return;
+    if (!this.isOpen()) return;
     const nodes = this.editor.selectedNodes();
     const links = this.editor.selectedLinks();
     const items = this.editor.selectedItems();
@@ -377,8 +331,12 @@ function setSwatch(btn: HTMLElement, color: string | null): void {
   btn.style.background = color == null || color === "transparent" ? "" : color;
 }
 
-/** Shared 48-swatch popup (8×6, transparent swatch rendered as checkerboard). */
-export function openSwatchPopup(anchor: HTMLElement, onPick: (color: string | null) => void): void {
+/** Shared 48-swatch popup (8×6, transparent swatch rendered as checkerboard).
+ *  `anchor` is the button it drops from, or a fixed screen point. */
+export function openSwatchPopup(
+  anchor: HTMLElement | { x: number; y: number },
+  onPick: (color: string | null) => void,
+): void {
   document.querySelector(".swatch-pop")?.remove();
   const pop = document.createElement("div");
   pop.className = "swatch-pop";
@@ -394,7 +352,10 @@ export function openSwatchPopup(anchor: HTMLElement, onPick: (color: string | nu
     pop.appendChild(b);
   }
   document.body.appendChild(pop);
-  const a = anchor.getBoundingClientRect();
+  const a =
+    anchor instanceof HTMLElement
+      ? anchor.getBoundingClientRect()
+      : new DOMRect(anchor.x, anchor.y, 0, 0);
   const r = pop.getBoundingClientRect();
   let x = a.left, y = a.bottom + 4;
   if (x + r.width > innerWidth - 4) x = Math.max(4, innerWidth - r.width - 4);

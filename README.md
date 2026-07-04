@@ -52,27 +52,43 @@ Do not reuse bundled legacy jars or distribution logic from VUE as authoritative
 6. Add desktop packaging in Tauri.
 7. Add mobile targets later from shared core.
 
-## Current state (2026-07-02)
+## Current state (2026-07-03)
 
-Nodes-and-edges MVP implemented (delivery plan steps 1, 2, and the node/link part of 5):
+Waves 1–4 complete. Wave 1: SVG canvas editor — tools (s/n/l/r/m, Space pan),
+node/link creation and editing, selection, undo/redo, zoom, native `.grue`
+format plus `.vue` import/export, legacy visual defaults preserved
+(docs/legacy-specs/). Wave 2: HTML menu bar, context menus, central shortcut
+dispatcher, format palette with the 48-swatch legacy palette, copy/paste style,
+notes, URL/file resources. Wave 3: floating panels (Layers, Info, Map Info,
+Outline, Panner, Search), view toggles and pruning, preferences, recently
+opened. Wave 4: Print / Print Visible / Export PDF through the system print
+dialog (whole map fitted to one page, or the current view), a real Help menu
+(About, User Guide, live keyboard-shortcut table generated from the actual
+bindings), and cross-platform CI builds.
 
-- Tauri 2 + Vite + TypeScript, no UI framework; SVG rendering.
-- Node/link editing: select, node, link, and pan tools (keys s/n/l/m, hold Space to pan);
-  drag-out or click node creation; drag node-to-node link creation with target highlight,
-  tail arrowhead, auto-curve for parallel links; marquee and shift-click selection;
-  move, resize handles, link endpoint re-attach, curve control points; inline label
-  editing (double-click); delete; duplicate; nudge; undo/redo; zoom presets, wheel
-  zoom/pan, fit, 100%.
-- Legacy defaults preserved: node fill #F2AE45, stroke #776D6D, round-rect arc 20,
-  link #404040 with tail arrow, selection chrome #4A95FF.
-- Native format `.grue` (JSON, docs/schema.md). Legacy `.vue` import (nodes, links,
-  curves, colors, fonts, labels, layers, groups flattened; images skipped) and minimal
-  `.vue` export, verified round-trip on real maps.
-- Extracted legacy behavior specs live in docs/legacy-specs/.
+### Build
 
-Build (Windows): `npm install`, then `npx tauri build`.
-Artifacts: portable exe at `src-tauri/target/release/Grue.exe`,
-installer at `src-tauri/target/release/bundle/nsis/`.
+Local (any platform): `npm install`, then `npx tauri build`.
+
+- Windows: portable exe at `src-tauri/target/release/Grue.exe`,
+  NSIS installer in `src-tauri/target/release/bundle/nsis/`.
+- macOS: dmg in `src-tauri/target/release/bundle/dmg/`
+  (Xcode command-line tools required).
+- Linux: AppImage and deb in `src-tauri/target/release/bundle/appimage/` and
+  `.../deb/` (install the Tauri 2 prerequisites first: `libwebkit2gtk-4.1-dev`,
+  `build-essential`, `libssl-dev`, `librsvg2-dev`, `libayatana-appindicator3-dev`).
+
+CI: `.github/workflows/build.yml` builds Windows x64 (NSIS), macOS Intel +
+Apple Silicon (dmg), Linux x64 and Linux ARM64 (AppImage + deb). Run it
+manually from the Actions tab, or push a `v*` tag — tag builds also draft a
+GitHub release with the installers attached (publish manually; nothing is
+auto-published and nothing auto-bumps versions). Installers are attached to
+every run as workflow artifacts.
+
+macOS note: builds are unsigned and un-notarized for now. On first launch,
+right-click the app and choose Open (or allow it under System Settings >
+Privacy & Security).
+
 Dev: `npm run tauri dev` (desktop) or `npm run dev` (browser, file dialogs fall back
 to download/upload).
 
