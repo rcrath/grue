@@ -1,6 +1,6 @@
 [package]
 name = "grue"
-version = "0.1.0"
+version = "0.2.0-alpha"
 description = "grue — visual knowledge-mapping application"
 edition = "2021"
 
