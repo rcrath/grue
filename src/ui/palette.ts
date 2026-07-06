@@ -44,10 +44,10 @@ const LINE_OPTIONS: { count: 0 | 1 | 2; label: string; title: string }[] = [
 ];
 
 export class FormatPalette extends FloatingPanel {
-  private editor: Editor;
+  private getEditor: () => Editor;
   private sig = "";
 
-  constructor(editor: Editor) {
+  constructor(getEditor: () => Editor) {
     super({
       key: "format",
       title: "Format",
@@ -55,8 +55,13 @@ export class FormatPalette extends FloatingPanel {
       closeHint: "Close (Ctrl+1)",
       defaultPos: { top: 96, right: 14 },
     });
-    this.editor = editor;
+    this.getEditor = getEditor;
     this.build();
+  }
+
+  /** Always the ACTIVE document's editor (multi-doc: panels track the active tab). */
+  private get editor(): Editor {
+    return this.getEditor();
   }
 
   protected onShow(): void {

@@ -7,10 +7,12 @@ import {
   GItem, GLink, createLayer, deleteLayer, duplicateLayer, getLayer,
   getNode, layerItems, renameLayer, reorderLayer,
 } from "../core/model";
+import { LogEntry, clear as clearLog, entries as logEntries, onLog } from "../core/log";
 import { Editor } from "./editor";
 import { FloatingPanel } from "./panel";
 import { FormatPalette, openSwatchPopup } from "./palette";
 import { openNotesEditor } from "./dialogs";
+import { openAttachment } from "./help";
 
 export interface FileInfo {
   getPath(): string | null;
@@ -53,7 +55,7 @@ export class LayersPanel extends FloatingPanel {
   private sig = "";
   private renamingId: string | null = null;
 
-  constructor(private editor: Editor) {
+  constructor(private getEditor: () => Editor) {
     super({ key: "layers", title: "Layers", className: "panel-md", closeHint: "Close (Ctrl+5)", defaultPos: { top: 96, left: 14 } });
     const body = div("panel-body");
     this.list = div("layer-list");
@@ -73,6 +75,11 @@ export class LayersPanel extends FloatingPanel {
     body.appendChild(row);
     this.root.appendChild(body);
     this.buttons = { dup, del, up, down };
+  }
+
+  /** Always the ACTIVE document's editor (multi-doc: panels track the active tab). */
+  private get editor(): Editor {
+    return this.getEditor();
   }
 
   private deleteActive(): void {
@@ -179,7 +186,7 @@ export class MapInfoPanel extends FloatingPanel {
   private bgBtn: HTMLButtonElement;
   private sig = "";
 
-  constructor(private editor: Editor, private file: FileInfo) {
+  constructor(private getEditor: () => Editor, private file: FileInfo) {
     super({ key: "mapinfo", title: "Map Info", className: "panel-md", closeHint: "Close (Ctrl+6)", defaultPos: { top: 300, left: 14 } });
     const body = div("panel-body");
 
@@ -200,6 +207,10 @@ export class MapInfoPanel extends FloatingPanel {
     bgRow.appendChild(this.bgBtn);
     body.appendChild(bgRow);
     this.root.appendChild(body);
+  }
+
+  private get editor(): Editor {
+    return this.getEditor();
   }
 
   refresh(): void {
@@ -231,7 +242,7 @@ export class InfoPanel extends FloatingPanel {
   private detail: HTMLElement;
   private sig = "";
 
-  constructor(private editor: Editor) {
+  constructor(private getEditor: () => Editor) {
     super({ key: "info", title: "Info", className: "panel-md", closeHint: "Close (Ctrl+2)", defaultPos: { top: 96, right: 260 } });
     const body = div("panel-body");
     this.kindEl = div("panel-value");
@@ -282,6 +293,10 @@ export class InfoPanel extends FloatingPanel {
     this.root.appendChild(body);
   }
 
+  private get editor(): Editor {
+    return this.getEditor();
+  }
+
   private single(): GItem | undefined {
     return this.editor.selection.size === 1 ? this.editor.selectedItems()[0] : undefined;
   }
@@ -312,11 +327,16 @@ export class InfoPanel extends FloatingPanel {
     }
     if (it.resource) {
       this.resEl.textContent = it.resource.title ? `${it.resource.title} — ${it.resource.spec}` : it.resource.spec;
-      this.resEl.title = it.resource.spec;
+      this.resEl.title = `${it.resource.spec} (click to open)`;
+      this.resEl.style.cursor = "pointer";
+      const spec = it.resource.spec;
+      this.resEl.onclick = () => openAttachment(spec);
       this.resRemove.style.display = "";
     } else {
       this.resEl.textContent = "none";
       this.resEl.title = "";
+      this.resEl.style.cursor = "";
+      this.resEl.onclick = null;
       this.resRemove.style.display = "none";
     }
     this.notesEl.textContent = it.notes ? short(it.notes, 220) : "none";
@@ -329,12 +349,16 @@ export class OutlinePanel extends FloatingPanel {
   private list: HTMLElement;
   private sig = "";
 
-  constructor(private editor: Editor) {
+  constructor(private getEditor: () => Editor) {
     super({ key: "outline", title: "Outline", className: "panel-md", closeHint: "Close (Ctrl+7)", defaultPos: { top: 96, left: 260 } });
     const body = div("panel-body panel-scroll");
     this.list = div("outline-list");
     body.appendChild(this.list);
     this.root.appendChild(body);
+  }
+
+  private get editor(): Editor {
+    return this.getEditor();
   }
 
   refresh(): void {
@@ -384,7 +408,7 @@ export class PannerPanel extends FloatingPanel {
   private canvas: HTMLCanvasElement;
   private view = { scale: 1, ox: 0, oy: 0 }; // world→canvas mapping of the last draw
 
-  constructor(private editor: Editor) {
+  constructor(private getEditor: () => Editor) {
     super({ key: "panner", title: "Panner", closeHint: "Close (Ctrl+8)", defaultPos: { bottom: 40, right: 14 } });
     this.canvas = document.createElement("canvas");
     this.canvas.width = PANNER_W;
@@ -408,6 +432,10 @@ export class PannerPanel extends FloatingPanel {
       if (dragging) jump(e);
     });
     this.canvas.addEventListener("pointerup", () => (dragging = false));
+  }
+
+  private get editor(): Editor {
+    return this.getEditor();
   }
 
   refresh(): void {
@@ -466,7 +494,7 @@ export class SearchPanel extends FloatingPanel {
   private results: HTMLElement;
   private lastQuery = "";
 
-  constructor(private editor: Editor) {
+  constructor(private getEditor: () => Editor) {
     super({ key: "search", title: "Search", className: "panel-md", closeHint: "Close (Ctrl+9)", defaultPos: { top: 300, right: 14 } });
     const body = div("panel-body");
     this.input = document.createElement("input");
@@ -480,6 +508,10 @@ export class SearchPanel extends FloatingPanel {
     this.results = div("search-results");
     body.appendChild(this.results);
     this.root.appendChild(body);
+  }
+
+  private get editor(): Editor {
+    return this.getEditor();
   }
 
   protected onShow(): void {
@@ -526,6 +558,66 @@ export class SearchPanel extends FloatingPanel {
   }
 }
 
+// ---------------------------------------------------------------- Log
+
+function timeStr(ms: number): string {
+  const d = new Date(ms);
+  return d.toLocaleTimeString(undefined, { hour12: false }) + "." + String(d.getMilliseconds()).padStart(3, "0");
+}
+
+function logLine(e: LogEntry): string {
+  return `[${timeStr(e.time)}] ${e.level.toUpperCase()} ${e.message}`;
+}
+
+/** Help > Show Log: a live view of the console.log/warn/error ring buffer plus
+ *  captured window errors and unhandled rejections (core/log.ts). */
+export class LogPanel extends FloatingPanel {
+  private list: HTMLElement;
+  /** Fires the first time the panel opens after being closed — main.ts uses
+   *  this to clear the status-bar error indicator. */
+  onOpened: () => void = () => {};
+
+  constructor() {
+    super({ key: "log", title: "Log", className: "panel-md panel-log", closeHint: "Close", defaultPos: { bottom: 40, left: 240 } });
+    const body = div("panel-body");
+    this.list = div("log-list panel-scroll");
+    body.appendChild(this.list);
+    const row = div("panel-btn-row");
+    row.appendChild(btn("clear", "Clear the log", () => {
+      clearLog();
+      this.rebuild();
+    }));
+    row.appendChild(btn("copy", "Copy all entries to the clipboard", () => this.copyAll()));
+    body.appendChild(row);
+    this.root.appendChild(body);
+
+    onLog((e) => {
+      if (this.isOpen()) this.appendRow(e);
+    });
+  }
+
+  protected onShow(): void {
+    this.rebuild();
+    this.onOpened();
+  }
+
+  private rebuild(): void {
+    this.list.replaceChildren();
+    for (const e of logEntries()) this.appendRow(e);
+  }
+
+  private appendRow(e: LogEntry): void {
+    const row = div(`log-row log-${e.level}`, logLine(e));
+    this.list.appendChild(row);
+    this.list.scrollTop = this.list.scrollHeight;
+  }
+
+  private copyAll(): void {
+    const text = logEntries().map(logLine).join("\n");
+    void navigator.clipboard?.writeText(text).catch(() => {});
+  }
+}
+
 // ---------------------------------------------------------------- panel set
 
 export interface PanelSet {
@@ -536,6 +628,7 @@ export interface PanelSet {
   outline: OutlinePanel;
   panner: PannerPanel;
   search: SearchPanel;
+  log: LogPanel;
   all(): FloatingPanel[];
   /** Gather Windows: put every panel back at its default position. */
   gather(): void;
@@ -543,17 +636,18 @@ export interface PanelSet {
   refreshAll(): void;
 }
 
-export function createPanels(editor: Editor, file: FileInfo): PanelSet {
-  const palette = new FormatPalette(editor);
-  const info = new InfoPanel(editor);
-  const layers = new LayersPanel(editor);
-  const mapInfo = new MapInfoPanel(editor, file);
-  const outline = new OutlinePanel(editor);
-  const panner = new PannerPanel(editor);
-  const search = new SearchPanel(editor);
-  const list: FloatingPanel[] = [palette, info, layers, mapInfo, outline, panner, search];
+export function createPanels(getEditor: () => Editor, file: FileInfo): PanelSet {
+  const palette = new FormatPalette(getEditor);
+  const info = new InfoPanel(getEditor);
+  const layers = new LayersPanel(getEditor);
+  const mapInfo = new MapInfoPanel(getEditor, file);
+  const outline = new OutlinePanel(getEditor);
+  const panner = new PannerPanel(getEditor);
+  const search = new SearchPanel(getEditor);
+  const log = new LogPanel();
+  const list: FloatingPanel[] = [palette, info, layers, mapInfo, outline, panner, search, log];
   return {
-    palette, info, layers, mapInfo, outline, panner, search,
+    palette, info, layers, mapInfo, outline, panner, search, log,
     all: () => list,
     gather: () => list.forEach((p) => p.gather()),
     refreshAll: () => list.forEach((p) => p.refresh()),

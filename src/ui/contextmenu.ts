@@ -2,11 +2,20 @@
 // multi-selection, group, and image-variant menus. Menu shapes only — every
 // item delegates to the shared action registry.
 
-import { ActionMap, isImageResource } from "./actions";
-import { GItem, GLink, getNode } from "../core/model";
+import type { ActionMap } from "./actions";
+import { GItem, GLink, getNode, isImageResource } from "../core/model";
 import { Editor } from "./editor";
 import { MenuEntry, openRootMenu } from "./menu";
-import { alignSub, arrowSub, fontSub, imageSub, lineSub, shapeSub } from "./menubar";
+import { alignSub, arrangeSub, arrowSub, fontSub, imageSub, lineSub, shapeSub } from "./menubar";
+
+/** World coordinates of the most recent canvas right-click. The canvas menu's
+ *  "Add a New Node" action reads this so the node lands exactly where the user
+ *  right-clicked, not wherever the mouse ended up over the menu. */
+let contextWorld: { x: number; y: number } | null = null;
+
+export function lastCanvasContextPoint(): { x: number; y: number } | null {
+  return contextWorld;
+}
 
 const sep: MenuEntry = { sep: true };
 
@@ -34,6 +43,12 @@ function resourceEntries(it: GItem): MenuEntry[] {
 function canvasMenu(): MenuEntry[] {
   // Paste Style omitted per spec recommendation (style paste needs a selected target)
   return [
+    // tool/mode block (issue #9): quick mode switching + node creation at the click point
+    { id: "tool.select" },
+    { id: "canvas.newNodeHere" },
+    { id: "tool.link" },
+    { id: "tool.combo" },
+    sep,
     { id: "edit.paste" },
     sep,
     { id: "edit.selectAll" },
@@ -47,13 +62,14 @@ function canvasMenu(): MenuEntry[] {
   ];
 }
 
-function nodeMenu(editor: Editor, node: GItem): MenuEntry[] {
+function nodeMenu(ed: () => Editor, node: GItem): MenuEntry[] {
   return [
     { id: "format.copyStyle" },
     { id: "format.pasteStyle" },
     sep,
-    shapeSub(editor),
-    fontSub(editor),
+    shapeSub(ed),
+    fontSub(ed),
+    arrangeSub(ed),
     sep,
     ...resourceEntries(node),
     { id: "content.notes" },
@@ -80,30 +96,31 @@ function pruneEntries(editor: Editor, link: GLink): MenuEntry[] {
   ];
 }
 
-function linkMenu(editor: Editor, link: GLink): MenuEntry[] {
+function linkMenu(ed: () => Editor, link: GLink): MenuEntry[] {
   return [
     { id: "format.copyStyle" },
     { id: "format.pasteStyle" },
     sep,
-    lineSub(editor),
-    arrowSub(editor),
+    lineSub(ed),
+    arrowSub(ed),
+    arrangeSub(ed),
     sep,
     ...resourceEntries(link),
     { id: "content.notes" },
     sep,
-    ...pruneEntries(editor, link),
+    ...pruneEntries(ed(), link),
     { id: "item.hide" },
     sep,
     ...editBlock,
   ];
 }
 
-function imageNodeMenu(): MenuEntry[] {
+function imageNodeMenu(ed: () => Editor): MenuEntry[] {
   return [
     { id: "format.copyStyle" },
     { id: "format.pasteStyle" },
     sep,
-    imageSub(),
+    imageSub(ed),
     sep,
     { id: "content.replaceFile" },
     { id: "content.replaceUrl" },
@@ -127,16 +144,17 @@ function groupMenu(): MenuEntry[] {
   ];
 }
 
-function multiMenu(editor: Editor): MenuEntry[] {
+function multiMenu(ed: () => Editor): MenuEntry[] {
   return [
     { id: "format.copyStyle" },
     { id: "format.pasteStyle" },
     sep,
-    shapeSub(editor),
-    lineSub(editor),
-    arrowSub(editor),
-    fontSub(editor),
-    alignSub(editor),
+    shapeSub(ed),
+    lineSub(ed),
+    arrowSub(ed),
+    fontSub(ed),
+    alignSub(ed),
+    arrangeSub(ed),
     sep,
     { id: "edit.group" },
     { id: "edit.ungroup" },
@@ -147,21 +165,26 @@ function multiMenu(editor: Editor): MenuEntry[] {
   ];
 }
 
-export function installContextMenu(canvas: HTMLElement, editor: Editor, actions: ActionMap): void {
+export function installContextMenu(canvas: HTMLElement, ed: () => Editor, actions: ActionMap): void {
   canvas.addEventListener("contextmenu", (e) => {
     e.preventDefault();
+    const editor = ed(); // active document's editor
     const w = editor.screenToWorld(e.clientX, e.clientY);
+    contextWorld = w; // remembered for canvas.newNodeHere
     const hit = editor.contextHit(w);
 
     let entries: MenuEntry[];
     if (!hit) {
       entries = canvasMenu();
     } else if (editor.selection.size > 1) {
-      entries = editor.selectionIsGroup() ? groupMenu() : multiMenu(editor);
+      entries = editor.selectionIsGroup() ? groupMenu() : multiMenu(ed);
     } else if (hit.kind === "node") {
-      entries = isImageResource(hit.resource) ? imageNodeMenu() : nodeMenu(editor, hit);
+      entries =
+        hit.image != null || isImageResource(hit.resource)
+          ? imageNodeMenu(ed)
+          : nodeMenu(ed, hit);
     } else {
-      entries = linkMenu(editor, hit);
+      entries = linkMenu(ed, hit);
     }
     openRootMenu(entries, actions, { x: e.clientX, y: e.clientY });
   });

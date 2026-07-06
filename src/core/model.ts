@@ -46,6 +46,26 @@ export interface GResource {
   properties: { key: string; value: string }[];
 }
 
+/** True when a resource points at an image file (an "image node" is just a node
+ *  whose attached resource is an image — no separate image component type). */
+export function isImageResource(r: GResource | null): boolean {
+  if (!r) return false;
+  const spec = r.spec.split(/[?#]/)[0];
+  return /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(spec);
+}
+
+/** Inline image display block on a node (the image FILE is the node's resource).
+ *  w/h reserve the display box in map units; the bitmap is drawn aspect-fit
+ *  inside it. naturalW/H come from the legacy resource properties
+ *  image.width / image.height when known. */
+export interface GImage {
+  w: number;
+  h: number;
+  naturalW: number | null;
+  naturalH: number | null;
+  hidden: boolean; // Format > Image > Hide Image
+}
+
 /** Flat item group: members select/move as a unit. Minimal wave-2 model —
  *  no nesting, no group-owned geometry or style (legacy LWGroup is a container;
  *  grue keeps membership sets and expands selection to whole groups). */
@@ -79,10 +99,12 @@ export interface GNode {
   font: GFont;
   autoSized: boolean;
   hidden: boolean;
-  collapsed: boolean; // hides children (no node-children yet; kept for format stability)
+  collapsed: boolean; // hides this node's children (and links to them)
   layer: string; // GLayer id
   notes: string;
   resource: GResource | null;
+  parent: string | null; // containing node id (node containment), null = top-level
+  image: GImage | null; // inline image display (file comes from `resource`)
 }
 
 export interface LinkEnd {
@@ -189,6 +211,8 @@ export function makeNode(doc: GDoc, x: number, y: number, w: number, h: number, 
     layer: doc.activeLayer,
     notes: "",
     resource: null,
+    parent: null,
+    image: null,
   };
 }
 
@@ -344,9 +368,12 @@ export function duplicateLayer(doc: GDoc, id: string): GLayer | null {
     clones.push(clone);
   }
   for (const c of clones) {
-    if (c.kind !== "link") continue;
-    c.head.node = c.head.node ? idMap.get(c.head.node) ?? null : null;
-    c.tail.node = c.tail.node ? idMap.get(c.tail.node) ?? null : null;
+    if (c.kind === "link") {
+      c.head.node = c.head.node ? idMap.get(c.head.node) ?? null : null;
+      c.tail.node = c.tail.node ? idMap.get(c.tail.node) ?? null : null;
+    } else {
+      c.parent = c.parent ? idMap.get(c.parent) ?? null : null;
+    }
   }
   doc.items.push(...clones);
   doc.activeLayer = dupe.id;
@@ -395,10 +422,257 @@ export function expandToGroups(doc: GDoc, ids: Set<string>): Set<string> {
   return out;
 }
 
-/** Delete items by id. Deleting a node detaches (frees) link endpoints connected to it,
- *  unless the link is also being deleted. Fully dangling links (both ends were attached
+// ---- node containment (parent/child) ----
+
+// Legacy LWNode child-layout constants (LWNode.java): children stack in a
+// vertical column below the label with small padding; the parent grows to fit.
+export const EDGE_PAD_Y = 4;
+export const CHILD_PAD_X = 5; // ChildPadX (no icon gutter in grue)
+export const CHILD_GAP_Y = 3; // ChildVerticalGap
+export const CHILD_PAD_BOTTOM = 2; // ChildrenPadBottom
+
+/** Direct children of a node, in items (z) order. */
+export function childrenOf(doc: GDoc, nodeId: string): GNode[] {
+  return doc.items.filter((i): i is GNode => i.kind === "node" && i.parent === nodeId);
+}
+
+/** True when `maybeDesc` sits somewhere below `ancestorId` in the containment tree. */
+export function isDescendantOf(doc: GDoc, maybeDescId: string, ancestorId: string): boolean {
+  let cur = getNode(doc, maybeDescId);
+  const seen = new Set<string>();
+  while (cur && cur.parent != null && !seen.has(cur.id)) {
+    if (cur.parent === ancestorId) return true;
+    seen.add(cur.id);
+    cur = getNode(doc, cur.parent);
+  }
+  return false;
+}
+
+/** Expand a set of item ids with every node descendant of any node in the set
+ *  (children move/copy/delete with their parent). */
+export function expandWithDescendants(doc: GDoc, ids: Set<string>): Set<string> {
+  const out = new Set(ids);
+  const kids = new Map<string, GNode[]>();
+  for (const n of nodes(doc)) {
+    if (n.parent == null) continue;
+    let arr = kids.get(n.parent);
+    if (!arr) kids.set(n.parent, (arr = []));
+    arr.push(n);
+  }
+  const queue = [...ids];
+  while (queue.length) {
+    const id = queue.pop()!;
+    for (const c of kids.get(id) ?? []) {
+      if (!out.has(c.id)) {
+        out.add(c.id);
+        queue.push(c.id);
+      }
+    }
+  }
+  return out;
+}
+
+/** Node ids of a node's whole subtree (itself + descendants), in items order. */
+export function subtreeNodeIds(doc: GDoc, rootId: string): string[] {
+  const set = expandWithDescendants(doc, new Set([rootId]));
+  return doc.items.filter((i) => i.kind === "node" && set.has(i.id)).map((i) => i.id);
+}
+
+/** Make `childId` a child of `parentId`: sets the parent ref, moves the child's
+ *  subtree onto the parent's layer, and reorders items so the subtree paints
+ *  right after the parent's existing subtree (children always paint above
+ *  their parent). Refuses cycles and self-parenting. */
+export function attachChild(doc: GDoc, childId: string, parentId: string): boolean {
+  const child = getNode(doc, childId);
+  const parent = getNode(doc, parentId);
+  if (!child || !parent || child.id === parent.id) return false;
+  if (isDescendantOf(doc, parentId, childId)) return false; // would create a cycle
+  child.parent = parent.id;
+  const sub = new Set(subtreeNodeIds(doc, childId));
+  for (const id of sub) {
+    const n = getNode(doc, id);
+    if (n) n.layer = parent.layer;
+  }
+  // reorder: pull the subtree out and re-insert after the parent's subtree
+  const moved = doc.items.filter((i) => sub.has(i.id));
+  const rest = doc.items.filter((i) => !sub.has(i.id));
+  const parentSub = new Set(subtreeNodeIds(doc, parentId));
+  let insertAt = -1;
+  for (let i = 0; i < rest.length; i++) if (parentSub.has(rest[i].id)) insertAt = i;
+  if (insertAt < 0) return true; // parent vanished mid-flight; refs are still consistent
+  rest.splice(insertAt + 1, 0, ...moved);
+  doc.items = rest;
+  return true;
+}
+
+/** Detach a node from its parent (it stays where it is on the canvas). */
+export function detachChild(doc: GDoc, childId: string): void {
+  const child = getNode(doc, childId);
+  if (child) child.parent = null;
+}
+
+/** Height of the label block at the top of a node (0 when label-less).
+ *  Pure line-count arithmetic — no text measurement needed. */
+export function labelBlockHeight(n: GNode): number {
+  if (!n.label) return 0;
+  const lines = n.label.split("\n").length;
+  return lines * Math.round(n.font.size * 1.25) + EDGE_PAD_Y * 2;
+}
+
+function contentTopPad(n: GNode): number {
+  const lh = labelBlockHeight(n);
+  return lh > 0 ? lh : EDGE_PAD_Y;
+}
+
+/** Where a node's inline image draws, in map coordinates. The image fills the
+ *  area below the label (whole node when label-less and childless); the bitmap
+ *  is aspect-fit inside this box at render time. Null when no visible image. */
+export function imageBox(
+  n: GNode,
+  hasChildren: boolean,
+): { x: number; y: number; w: number; h: number } | null {
+  if (!n.image || n.image.hidden) return null;
+  if (!n.label && !hasChildren) return { x: n.x, y: n.y, w: n.w, h: n.h };
+  return {
+    x: n.x + CHILD_PAD_X,
+    y: n.y + contentTopPad(n),
+    w: Math.max(4, n.w - CHILD_PAD_X * 2),
+    h: n.image.h,
+  };
+}
+
+/** Containment layout, legacy LWNode column style: children stack vertically
+ *  inside the parent below the label (and below the inline image), small
+ *  padding, parent grows to contain them. Sizes are computed bottom-up,
+ *  positions top-down. Widths only grow (labels aren't measurable here);
+ *  heights are set from content for auto-sized or collapsed parents and
+ *  clamped-to-content otherwise. Idempotent. */
+export function layoutContainers(doc: GDoc): void {
+  const byId = new Map<string, GNode>();
+  for (const n of nodes(doc)) byId.set(n.id, n);
+  const kids = new Map<string, GNode[]>();
+  let anyImage = false;
+  for (const n of nodes(doc)) {
+    if (n.image) anyImage = true;
+    if (n.parent == null) continue;
+    const p = byId.get(n.parent);
+    if (!p || p.id === n.id) {
+      n.parent = null; // dangling/self parent ref
+      continue;
+    }
+    let arr = kids.get(n.parent);
+    if (!arr) kids.set(n.parent, (arr = []));
+    arr.push(n);
+  }
+  if (kids.size === 0 && !anyImage) return;
+
+  const depthCache = new Map<string, number>();
+  const depthOf = (n: GNode): number => {
+    const hit = depthCache.get(n.id);
+    if (hit != null) return hit;
+    let d = 0;
+    let cur: GNode | undefined = n;
+    const seen = new Set<string>();
+    while (cur && cur.parent != null && !seen.has(cur.id)) {
+      seen.add(cur.id);
+      cur = byId.get(cur.parent);
+      d++;
+    }
+    depthCache.set(n.id, d);
+    return d;
+  };
+
+  const containers = nodes(doc).filter((n) => kids.has(n.id) || n.image != null);
+
+  // pass 1: sizes, deepest first
+  containers.sort((a, b) => depthOf(b) - depthOf(a));
+  for (const p of containers) {
+    const cs = (kids.get(p.id) ?? []).filter((c) => !c.hidden);
+    const img = p.image && !p.image.hidden ? p.image : null;
+    if (img && !p.label && cs.length === 0) {
+      // pure image node: frame tracks the image display box exactly
+      p.w = Math.max(10, img.w);
+      p.h = Math.max(10, img.h);
+      continue;
+    }
+    const top = contentTopPad(p);
+    let contentH = top;
+    let minW = 10;
+    if (img) {
+      contentH += img.h;
+      minW = Math.max(minW, img.w + CHILD_PAD_X * 2);
+    }
+    if (!p.collapsed && cs.length) {
+      if (img) contentH += CHILD_GAP_Y;
+      for (let i = 0; i < cs.length; i++) {
+        contentH += cs[i].h + (i < cs.length - 1 ? CHILD_GAP_Y : 0);
+        minW = Math.max(minW, cs[i].w + CHILD_PAD_X * 2);
+      }
+      contentH += CHILD_PAD_BOTTOM;
+    } else if (img) {
+      contentH += CHILD_PAD_BOTTOM;
+    } else if (!p.label) {
+      contentH = 10; // collapsed/empty label-less shell
+    }
+    p.w = Math.max(p.w, minW);
+    p.h = p.autoSized || p.collapsed ? Math.max(contentH, 10) : Math.max(p.h, contentH);
+  }
+
+  // pass 2: positions, shallowest first (a child's own children are placed
+  // after the child has moved, so no subtree translation is needed)
+  containers.sort((a, b) => depthOf(a) - depthOf(b));
+  for (const p of containers) {
+    if (p.collapsed) continue;
+    const cs = (kids.get(p.id) ?? []).filter((c) => !c.hidden);
+    if (!cs.length) continue;
+    const img = p.image && !p.image.hidden ? p.image : null;
+    let y = p.y + contentTopPad(p) + (img ? img.h + CHILD_GAP_Y : 0);
+    for (const c of cs) {
+      c.x = p.x + CHILD_PAD_X;
+      c.y = y;
+      y += c.h + CHILD_GAP_Y;
+    }
+  }
+}
+
+/** Item ids hidden because an ancestor node is collapsed: every descendant of a
+ *  collapsed parent, plus links with an endpoint on a hidden descendant
+ *  (legacy hides such links entirely). The collapsed parent itself stays visible. */
+export function collapseHiddenIds(doc: GDoc): Set<string> {
+  const hidden = new Set<string>();
+  const all = nodes(doc);
+  if (!all.some((n) => n.collapsed)) return hidden;
+  const byId = new Map<string, GNode>();
+  for (const n of all) byId.set(n.id, n);
+  for (const n of all) {
+    if (n.parent == null) continue;
+    let cur = byId.get(n.parent);
+    const seen = new Set<string>([n.id]);
+    while (cur && !seen.has(cur.id)) {
+      if (cur.collapsed) {
+        hidden.add(n.id);
+        break;
+      }
+      seen.add(cur.id);
+      cur = cur.parent != null ? byId.get(cur.parent) : undefined;
+    }
+  }
+  if (hidden.size) {
+    for (const l of links(doc)) {
+      if ((l.head.node != null && hidden.has(l.head.node)) || (l.tail.node != null && hidden.has(l.tail.node)))
+        hidden.add(l.id);
+    }
+  }
+  return hidden;
+}
+
+/** Delete items by id. Deleting a node also deletes its children (containment),
+ *  and detaches (frees) link endpoints connected to deleted nodes unless the
+ *  link is also being deleted. Fully dangling links (both ends were attached
  *  only to deleted nodes) are removed with the node, matching editor expectations. */
 export function deleteItems(doc: GDoc, ids: Set<string>): void {
+  // children die with their parent
+  for (const id of expandWithDescendants(doc, ids)) ids.add(id);
   const deletingNodes = new Set(
     doc.items.filter((i) => i.kind === "node" && ids.has(i.id)).map((i) => i.id),
   );
@@ -570,6 +844,10 @@ export function docFromJson(text: string): GDoc {
     if (typeof it.layer !== "string" || !layerIds.has(it.layer)) it.layer = layers[0].id;
     if (it.kind === "node") {
       it.collapsed = (it as { collapsed?: unknown }).collapsed === true;
+      // v2-additive fields: parent (containment) and image (inline display)
+      const rawParent = (it as { parent?: unknown }).parent;
+      it.parent = typeof rawParent === "string" ? rawParent : null;
+      it.image = normalizeImage((it as { image?: unknown }).image);
       // v1 stored a bare url string; migrate it to a resource
       const legacyUrl = (it as unknown as { url?: unknown }).url;
       if (it.resource == null && typeof legacyUrl === "string" && legacyUrl)
@@ -594,8 +872,41 @@ export function docFromJson(text: string): GDoc {
   }
   doc.groups = groups;
 
+  // containment sanity: parent must be an existing node; break cycles
+  const nodeIds = new Set(doc.items.filter((i) => i.kind === "node").map((i) => i.id));
+  for (const it of doc.items) {
+    if (it.kind !== "node") continue;
+    if (it.parent != null && (!nodeIds.has(it.parent) || it.parent === it.id)) it.parent = null;
+  }
+  for (const it of doc.items) {
+    if (it.kind !== "node" || it.parent == null) continue;
+    const seen = new Set<string>([it.id]);
+    let cur = getNode(doc, it.parent);
+    while (cur) {
+      if (seen.has(cur.id)) {
+        it.parent = null; // cycle: cut it at this node
+        break;
+      }
+      seen.add(cur.id);
+      cur = cur.parent != null ? getNode(doc, cur.parent) : undefined;
+    }
+  }
+
   doc.nextId = Math.max(typeof j.nextId === "number" ? j.nextId : 1, maxId + 1);
   return doc;
+}
+
+function normalizeImage(v: unknown): GImage | null {
+  if (!v || typeof v !== "object") return null;
+  const o = v as { w?: unknown; h?: unknown; naturalW?: unknown; naturalH?: unknown; hidden?: unknown };
+  if (typeof o.w !== "number" || typeof o.h !== "number" || o.w <= 0 || o.h <= 0) return null;
+  return {
+    w: o.w,
+    h: o.h,
+    naturalW: typeof o.naturalW === "number" && o.naturalW > 0 ? o.naturalW : null,
+    naturalH: typeof o.naturalH === "number" && o.naturalH > 0 ? o.naturalH : null,
+    hidden: o.hidden === true,
+  };
 }
 
 function normalizeResource(r: unknown): GResource | null {

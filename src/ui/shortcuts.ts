@@ -19,6 +19,7 @@ export const BINDINGS: Record<string, string> = {
   "mod+p": "file.print",
   "mod+w": "file.close",
   "mod+n": "edit.newNodeAtCursor", // reality: legacy Ctrl+N = new node at cursor (kept from wave 1)
+  "mod+alt+n": "file.new", // New Map (issue #4: Ctrl+Shift+N is grabbed by the clipboard manager)
   "mod+z": "edit.undo",
   "mod+shift+z": "edit.redo",
   "mod+y": "edit.redo",
@@ -56,6 +57,8 @@ export const BINDINGS: Record<string, string> = {
   "mod+7": "window.outline",
   "mod+8": "window.panner",
   "mod+9": "window.metaSearch",
+  "mod+tab": "window.nextDoc", // cycle document tabs (Tauri; browsers reserve Ctrl+Tab)
+  "mod+shift+tab": "window.prevDoc",
   "alt+arrowup": "format.align.top",
   "alt+arrowdown": "format.align.bottom",
   "alt+arrowleft": "format.align.left",

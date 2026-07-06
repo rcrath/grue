@@ -36,6 +36,11 @@ jobs:
           - name: windows-x64
             runner: windows-latest
             args: ""
+          # windows-11-arm is GitHub's free Windows ARM64 runner for PUBLIC
+          # repos (GA April 2025); native aarch64 toolchain, NSIS arm64 installer.
+          - name: windows-arm64
+            runner: windows-11-arm
+            args: ""
           - name: macos-arm64
             runner: macos-latest
             rust-targets: aarch64-apple-darwin
@@ -84,6 +89,14 @@ jobs:
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # macOS-only: presence of these triggers tauri-action's built-in
+          # codesign + notarize + staple. Left unset on Windows/Linux jobs.
+          APPLE_CERTIFICATE: ${{ startsWith(matrix.runner, 'macos') && secrets.APPLE_CERTIFICATE || '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ startsWith(matrix.runner, 'macos') && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+          APPLE_SIGNING_IDENTITY: ${{ startsWith(matrix.runner, 'macos') && secrets.APPLE_SIGNING_IDENTITY || '' }}
+          APPLE_TEAM_ID: ${{ startsWith(matrix.runner, 'macos') && secrets.APPLE_TEAM_ID || '' }}
+          APPLE_ID: ${{ startsWith(matrix.runner, 'macos') && secrets.APPLE_ID || '' }}
+          APPLE_PASSWORD: ${{ startsWith(matrix.runner, 'macos') && secrets.APPLE_PASSWORD || '' }}
         with:
           args: ${{ matrix.args }}
           # empty tagName (non-tag runs) = build only, no release

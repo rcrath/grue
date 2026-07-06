@@ -19,6 +19,35 @@ export function openExternal(url: string): void {
   }
 }
 
+/** Brief bottom-of-screen message, e.g. for actions that need the desktop app. */
+function toast(message: string): void {
+  document.querySelector(".toast")?.remove();
+  const t = document.createElement("div");
+  t.className = "toast";
+  t.textContent = message;
+  document.body.appendChild(t);
+  setTimeout(() => t.classList.add("toast-out"), 1800);
+  setTimeout(() => t.remove(), 2200);
+}
+
+/** Open an attachment spec (badge click / Info panel Attachment line): http(s)
+ *  URLs go through openExternal; local paths open in the OS default app via
+ *  the opener plugin. Browser-dev fallback: URLs still open in a new tab,
+ *  local paths just aren't reachable from a browser tab. */
+export function openAttachment(spec: string): void {
+  if (/^https?:\/\//i.test(spec)) {
+    openExternal(spec);
+    return;
+  }
+  if (isTauri()) {
+    void import("@tauri-apps/plugin-opener")
+      .then((m) => m.openPath(spec))
+      .catch(() => toast(`Could not open: ${spec}`));
+  } else {
+    toast("Opening files needs the desktop app");
+  }
+}
+
 function baseDialog(title: string, wide = false): { overlay: HTMLElement; dlg: HTMLElement } {
   document.querySelector(".dlg-overlay")?.remove();
   const overlay = document.createElement("div");

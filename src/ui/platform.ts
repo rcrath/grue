@@ -1,5 +1,7 @@
 // File open/save: Tauri when available, browser fallbacks for `npm run dev` in a browser.
 
+import { getPref, setPref } from "./prefs";
+
 export interface OpenedFile {
   path: string | null; // null in browser fallback
   name: string;
@@ -10,19 +12,34 @@ export function isTauri(): boolean {
   return "__TAURI_INTERNALS__" in window;
 }
 
-const FILTERS = [
-  { name: "Grue map", extensions: ["grue"] },
-  { name: "VUE map", extensions: ["vue"] },
-  { name: "All files", extensions: ["*"] },
-];
+const GRUE_FILTER = { name: "Grue map", extensions: ["grue"] };
+const VUE_FILTER = { name: "VUE map", extensions: ["vue"] };
+const ALL_FILTER = { name: "All files", extensions: ["*"] };
+
+// Open dialog: a combined "Maps" filter first (so both extensions show by
+// default), then the type-specific and catch-all filters. Save keeps its own
+// type-specific first filter (see saveFileAs) — Save always writes one kind.
+const OPEN_FILTERS = [{ name: "Maps", extensions: ["grue", "vue"] }, GRUE_FILTER, VUE_FILTER, ALL_FILTER];
+
+/** Directory of the last file opened or saved (localStorage; Tauri only —
+ *  browser files have no real path to remember). */
+function lastDir(): string | null {
+  return getPref<string | null>("lastDir", null);
+}
+
+function rememberDir(path: string): void {
+  const i = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+  if (i > 0) setPref("lastDir", path.slice(0, i));
+}
 
 export async function openFile(): Promise<OpenedFile | null> {
   if (isTauri()) {
     const { open } = await import("@tauri-apps/plugin-dialog");
     const { readTextFile } = await import("@tauri-apps/plugin-fs");
-    const path = await open({ multiple: false, filters: FILTERS });
+    const path = await open({ multiple: false, filters: OPEN_FILTERS, defaultPath: lastDir() ?? undefined });
     if (typeof path !== "string") return null;
     const text = await readTextFile(path);
+    rememberDir(path);
     return { path, name: baseName(path), text };
   }
   return new Promise((resolve) => {
@@ -45,12 +62,15 @@ export async function saveFileAs(suggestedName: string, text: string): Promise<s
     const { save } = await import("@tauri-apps/plugin-dialog");
     const { writeTextFile } = await import("@tauri-apps/plugin-fs");
     const wantVue = suggestedName.toLowerCase().endsWith(".vue");
+    const dir = lastDir();
+    const defaultPath = dir ? `${dir}${dir.includes("\\") ? "\\" : "/"}${suggestedName}` : suggestedName;
     const path = await save({
-      defaultPath: suggestedName,
-      filters: wantVue ? [FILTERS[1], FILTERS[2]] : [FILTERS[0], FILTERS[2]],
+      defaultPath,
+      filters: wantVue ? [VUE_FILTER, ALL_FILTER] : [GRUE_FILTER, ALL_FILTER],
     });
     if (!path) return null;
     await writeTextFile(path, text);
+    rememberDir(path);
     return path;
   }
   const blob = new Blob([text], { type: "application/octet-stream" });
@@ -66,6 +86,7 @@ export async function saveFileTo(path: string, text: string): Promise<void> {
   if (isTauri()) {
     const { writeTextFile } = await import("@tauri-apps/plugin-fs");
     await writeTextFile(path, text);
+    rememberDir(path);
     return;
   }
   await saveFileAs(baseName(path), text);
@@ -82,8 +103,10 @@ export async function readFile(path: string): Promise<string> {
 export async function pickFilePath(): Promise<string | null> {
   if (isTauri()) {
     const { open } = await import("@tauri-apps/plugin-dialog");
-    const path = await open({ multiple: false });
-    return typeof path === "string" ? path : null;
+    const path = await open({ multiple: false, defaultPath: lastDir() ?? undefined });
+    if (typeof path !== "string") return null;
+    rememberDir(path);
+    return path;
   }
   return new Promise((resolve) => {
     const input = document.createElement("input");

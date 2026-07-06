@@ -2,6 +2,7 @@
 // rebuilt on every open so enabled/checked state is always current.
 
 import { ActionMap } from "./actions";
+import { DocManager } from "./docs";
 import { MenuEntry, anyMenuOpen, closeAllMenus, openRootMenu } from "./menu";
 import { SHAPE_ORDER } from "./palette";
 import { Editor } from "./editor";
@@ -14,31 +15,31 @@ function displayPath(p: string): string {
 
 const sep: MenuEntry = { sep: true };
 
-function shapeSub(editor: Editor): MenuEntry {
+function shapeSub(ed: () => Editor): MenuEntry {
   return {
     label: "Shape",
     sub: SHAPE_ORDER.map((s) => ({ id: `format.shape.${s}` })),
-    enabled: () => editor.selectedNodes().length > 0,
+    enabled: () => ed().selectedNodes().length > 0,
   };
 }
 
-function lineSub(editor: Editor): MenuEntry {
+function lineSub(ed: () => Editor): MenuEntry {
   return {
     label: "Line Style",
     sub: [{ id: "format.line.0" }, { id: "format.line.1" }, { id: "format.line.2" }],
-    enabled: () => editor.selectedLinks().length > 0,
+    enabled: () => ed().selectedLinks().length > 0,
   };
 }
 
-function arrowSub(editor: Editor): MenuEntry {
+function arrowSub(ed: () => Editor): MenuEntry {
   return {
     label: "Arrow",
     sub: [{ id: "format.arrow.0" }, { id: "format.arrow.1" }, { id: "format.arrow.2" }, { id: "format.arrow.3" }],
-    enabled: () => editor.selectedLinks().length > 0,
+    enabled: () => ed().selectedLinks().length > 0,
   };
 }
 
-function fontSub(editor: Editor): MenuEntry {
+function fontSub(ed: () => Editor): MenuEntry {
   return {
     label: "Font",
     sub: [
@@ -49,11 +50,11 @@ function fontSub(editor: Editor): MenuEntry {
       { id: "format.bigger" },
       { id: "format.smaller" },
     ],
-    enabled: () => editor.selection.size > 0,
+    enabled: () => ed().selection.size > 0,
   };
 }
 
-function imageSub(): MenuEntry {
+function imageSub(ed: () => Editor): MenuEntry {
   return {
     label: "Image",
     sub: [
@@ -61,15 +62,19 @@ function imageSub(): MenuEntry {
       { id: "format.image.smaller" },
       { id: "format.image.natural" },
       sep,
+      { id: "format.image.preset.64" },
+      { id: "format.image.preset.128" },
+      { id: "format.image.preset.256" },
+      { id: "format.image.preset.512" },
+      sep,
       { id: "format.image.hide" },
       { id: "format.image.show" },
     ],
-    enabled: () => false,
-    tooltip: "coming soon",
+    enabled: () => ed().imageNodes().length > 0,
   };
 }
 
-function alignSub(editor: Editor): MenuEntry {
+function alignSub(ed: () => Editor): MenuEntry {
   return {
     label: "Align",
     sub: [
@@ -80,19 +85,39 @@ function alignSub(editor: Editor): MenuEntry {
       sep,
       { id: "format.align.rowCenter" },
       { id: "format.align.colCenter" },
+      sep,
+      { id: "format.align.makeRow" },
+      { id: "format.align.makeColumn" },
+      sep,
+      { id: "format.dist.h" },
+      { id: "format.dist.v" },
     ],
-    enabled: () => editor.selectedNodes().length >= 2,
+    enabled: () => ed().selectedNodes().length >= 2,
   };
 }
 
-export { shapeSub, lineSub, arrowSub, fontSub, imageSub, alignSub };
+function arrangeSub(ed: () => Editor): MenuEntry {
+  return {
+    label: "Arrange",
+    sub: [
+      { id: "format.arrange.front" },
+      { id: "format.arrange.forward" },
+      { id: "format.arrange.backward" },
+      { id: "format.arrange.back" },
+    ],
+    enabled: () => ed().selection.size > 0,
+  };
+}
+
+export { shapeSub, lineSub, arrowSub, fontSub, imageSub, alignSub, arrangeSub };
 
 export function installMenuBar(
   container: HTMLElement,
   actions: ActionMap,
-  editor: Editor,
+  docs: DocManager,
   recentFiles: () => string[],
 ): void {
+  const ed = (): Editor => docs.activeEditor();
   // Recently Opened: Tauri-only (browser files have no reopenable path)
   const recentEntries = (): MenuEntry[] =>
     isTauri()
@@ -182,19 +207,20 @@ export function installMenuBar(
         { id: "format.copyStyle" },
         { id: "format.pasteStyle" },
         sep,
-        shapeSub(editor),
-        lineSub(editor),
-        arrowSub(editor),
-        fontSub(editor),
+        shapeSub(ed),
+        lineSub(ed),
+        arrowSub(ed),
+        fontSub(ed),
         { id: "format.bold" },
         { id: "format.italic" },
         { id: "format.underline" },
         { id: "format.bigger" },
         { id: "format.smaller" },
         sep,
-        imageSub(),
+        imageSub(ed),
         sep,
-        alignSub(editor),
+        alignSub(ed),
+        arrangeSub(ed),
         sep,
         { id: "edit.group" },
         { id: "edit.ungroup" },
@@ -228,6 +254,12 @@ export function installMenuBar(
         { id: "window.fsToolbar" },
         sep,
         { id: "window.gather" },
+        sep,
+        // one entry per open document (checkmark on the active one)
+        ...docs.list().slice(0, 20).map((d, i) => ({
+          id: `window.doc.${i}`,
+          label: d.name + (d.dirty ? " •" : ""),
+        })),
       ],
     },
     {

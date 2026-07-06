@@ -51,6 +51,48 @@ export function promptText(opts: {
   });
 }
 
+/** Three-way close prompt for a dirty document: Save / Don't Save / Cancel.
+ *  Enter = Save, Escape (or clicking outside) = Cancel. */
+export function confirmSaveClose(name: string): Promise<"save" | "discard" | "cancel"> {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.className = "dlg-overlay";
+    const dlg = document.createElement("div");
+    dlg.className = "dlg";
+    dlg.innerHTML = `
+      <div class="dlg-title">Unsaved changes</div>
+      <div class="dlg-text"></div>
+      <div class="dlg-buttons">
+        <button class="dlg-discard">Don't Save</button>
+        <button class="dlg-cancel">Cancel</button>
+        <button class="dlg-ok">Save</button>
+      </div>`;
+    dlg.querySelector(".dlg-text")!.textContent = `Save changes to “${name}” before closing?`;
+    overlay.appendChild(dlg);
+    document.body.appendChild(overlay);
+
+    const done = (value: "save" | "discard" | "cancel") => {
+      overlay.remove();
+      resolve(value);
+    };
+    const saveBtn = dlg.querySelector(".dlg-ok") as HTMLButtonElement;
+    saveBtn.addEventListener("click", () => done("save"));
+    (dlg.querySelector(".dlg-discard") as HTMLButtonElement).addEventListener("click", () => done("discard"));
+    (dlg.querySelector(".dlg-cancel") as HTMLButtonElement).addEventListener("click", () => done("cancel"));
+    overlay.addEventListener("pointerdown", (e) => {
+      if (e.target === overlay) done("cancel");
+    });
+    dlg.tabIndex = -1;
+    dlg.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      // Enter on a focused button activates THAT button (native click), not Save
+      if (e.key === "Enter" && (e.target as HTMLElement).tagName !== "BUTTON") done("save");
+      else if (e.key === "Escape") done("cancel");
+    });
+    saveBtn.focus();
+  });
+}
+
 /** Plain-text notes editor popup (nodes/links). Saves on close or blur;
  *  Escape discards changes made since open (ui-spec §6). */
 export function openNotesEditor(opts: {

@@ -1,6 +1,6 @@
 {
   "name": "grue",
-  "version": "0.2.0-alpha",
+  "version": "0.2.1-alpha",
   "description": "grue — visual knowledge-mapping application, functional successor to Tufts VUE",
   "type": "module",
   "scripts": {

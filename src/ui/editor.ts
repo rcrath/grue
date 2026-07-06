@@ -2,10 +2,12 @@
 // Interaction model follows legacy VUE (docs/legacy-specs/interaction.md).
 
 import {
-  FONT_SIZES, GDoc, GFont, GItem, GLink, GNode, GResource, LinkEnd, NodeShape,
-  STROKE_DASHES, SELECTION_COLOR, deleteItems, docBounds, expandToGroups, getLayer,
-  getNode, groupItems, hasStraightLinkBetween, isItemSelectable, isItemVisible,
-  makeLink, makeNode, newDoc, allocId, paintOrder, pruneHiddenIds, ungroupItems,
+  CHILD_PAD_X, CHILD_PAD_BOTTOM, FONT_SIZES, GDoc, GFont, GItem, GLink, GNode, GResource,
+  LinkEnd, NodeShape, STROKE_DASHES, SELECTION_COLOR, attachChild, childrenOf,
+  collapseHiddenIds, deleteItems, docBounds, expandToGroups, expandWithDescendants,
+  getLayer, getNode, groupItems, hasStraightLinkBetween, imageBox, isImageResource,
+  isItemSelectable, isItemVisible, labelBlockHeight, layoutContainers, makeLink,
+  makeNode, newDoc, allocId, paintOrder, pruneHiddenIds, ungroupItems,
 } from "../core/model";
 import {
   Pt, distSqToSegment, flattenLinkPath, linkMidpoint, nodeCenter, nodeOutline,
@@ -13,6 +15,10 @@ import {
 } from "../core/geometry";
 import { History } from "../core/history";
 import { autoSizeFor, fontToCss, measureLabel } from "./measure";
+import { isTauri } from "./platform";
+import { openNotesEditor } from "./dialogs";
+import { openAttachment } from "./help";
+import { convertFileSrc } from "@tauri-apps/api/core";
 
 export type Tool = "select" | "node" | "link" | "hand" | "combo" | "zoom";
 
@@ -46,7 +52,7 @@ const CREATE_MIN_PX = 10;
 type Drag =
   | { kind: "none" }
   | { kind: "maybeMove"; startS: Pt; startW: Pt; hitId: string }
-  | { kind: "move"; startW: Pt; orig: Map<string, { x: number; y: number }>; origLinks: Map<string, GLink>; moved: boolean }
+  | { kind: "move"; startW: Pt; orig: Map<string, { x: number; y: number }>; origLinks: Map<string, GLink>; moved: boolean; draggedIds: Set<string>; dropTarget: string | null }
   | { kind: "marquee"; startW: Pt; curW: Pt; toggle: boolean }
   | { kind: "nodeRect"; startW: Pt; curW: Pt; started: boolean }
   | { kind: "linkDraw"; sourceId: string; curW: Pt; targetId: string | null; startS: Pt; combo: boolean }
@@ -71,6 +77,8 @@ export class Editor {
   showLinkLabels = true;
   showPruning = true;
   private pruneSet: ReadonlySet<string> = new Set(); // items hidden by prunes; refreshed each render
+  private collapseSet: ReadonlySet<string> = new Set(); // items hidden by collapsed parents; refreshed each render
+  private brokenImages = new Set<string>(); // image specs that failed to load (placeholder instead)
 
   private history = new History();
   private drag: Drag = { kind: "none" };
@@ -95,6 +103,11 @@ export class Editor {
   /** Fires after every render (selection, style, or doc may have changed). */
   onRender: () => void = () => {};
 
+  // window-level key handlers, kept as fields so dispose() can remove them
+  // (multi-doc: one Editor per open tab, all listening on the same window)
+  private winKeyDown = (e: KeyboardEvent) => this.keyDown(e);
+  private winKeyUp = (e: KeyboardEvent) => this.keyUp(e);
+
   constructor(container: HTMLElement) {
     this.container = container;
     this.svg = el("svg") as SVGSVGElement;
@@ -115,8 +128,8 @@ export class Editor {
     this.svg.addEventListener("dblclick", (e) => this.doubleClick(e));
     this.svg.addEventListener("wheel", (e) => this.wheel(e), { passive: false });
     this.svg.addEventListener("contextmenu", (e) => e.preventDefault());
-    window.addEventListener("keydown", (e) => this.keyDown(e));
-    window.addEventListener("keyup", (e) => this.keyUp(e));
+    window.addEventListener("keydown", this.winKeyDown);
+    window.addEventListener("keyup", this.winKeyUp);
 
     this.render();
   }
@@ -125,7 +138,9 @@ export class Editor {
 
   setDoc(doc: GDoc): void {
     this.commitLabelEdit();
+    layoutContainers(doc); // normalize containment (no-op for flat maps)
     this.doc = doc;
+    this.brokenImages.clear();
     this.selection.clear();
     this.history.clear();
     this.dirty = false;
@@ -149,11 +164,19 @@ export class Editor {
     this.onChange();
   }
 
+  /** Detach window-level listeners when this document's tab closes. */
+  dispose(): void {
+    this.commitLabelEdit();
+    window.removeEventListener("keydown", this.winKeyDown);
+    window.removeEventListener("keyup", this.winKeyUp);
+  }
+
   /** Run a mutation with an undo checkpoint. Selection ids that no longer
    *  exist afterwards (deleted items, deleted layers' contents) are dropped. */
   mutate(fn: () => void): void {
     this.history.checkpoint(this.doc);
     fn();
+    layoutContainers(this.doc); // keep parents wrapped around their children
     this.pruneSelection();
     this.dirty = true;
     this.render();
@@ -342,6 +365,7 @@ export class Editor {
    *  link-display toggle. Use this (not isItemVisible) for anything on screen. */
   itemVisible(it: GItem): boolean {
     if (!isItemVisible(this.doc, it)) return false;
+    if (this.collapseSet.has(it.id)) return false; // inside a collapsed parent
     if (this.showPruning && this.pruneSet.has(it.id)) return false;
     if (it.kind === "link" && !this.showLinks) return false;
     return true;
@@ -670,7 +694,9 @@ export class Editor {
   // ---------- clipboard (in-memory, app-local) ----------
 
   copySelection(): void {
-    const items = this.selectedItems().map((i) => structuredClone(i));
+    // children travel with their parent (containment)
+    const ids = expandWithDescendants(this.doc, this.selection);
+    const items = this.doc.items.filter((i) => ids.has(i.id)).map((i) => structuredClone(i));
     if (!items.length) return;
     const groups = this.doc.groups
       .filter((g) => g.members.every((m) => this.selection.has(m)))
@@ -713,9 +739,12 @@ export class Editor {
         clones.push(clone);
       }
       for (const c of clones) {
-        if (c.kind !== "link") continue;
-        c.head.node = c.head.node ? idMap.get(c.head.node) ?? null : null;
-        c.tail.node = c.tail.node ? idMap.get(c.tail.node) ?? null : null;
+        if (c.kind === "link") {
+          c.head.node = c.head.node ? idMap.get(c.head.node) ?? null : null;
+          c.tail.node = c.tail.node ? idMap.get(c.tail.node) ?? null : null;
+        } else {
+          c.parent = c.parent ? idMap.get(c.parent) ?? null : null;
+        }
       }
       this.doc.items.push(...clones);
       for (const members of src.groups) {
@@ -778,6 +807,106 @@ export class Editor {
           case "right": n.x = right - n.w; break;
           case "rowCenter": n.y = cy - n.h / 2; break;
           case "colCenter": n.x = cx - n.w / 2; break;
+        }
+      }
+    });
+  }
+
+  // ---------- arrange (z-order / row / column / distribute) ----------
+
+  /** Z-order arrange: reorder the selected items within their layer.
+   *  doc.items array order = paint order within a layer (paintOrder groups by
+   *  layer), so this rebuilds the per-layer sequences and concatenates them. */
+  arrangeZ(mode: "front" | "back" | "forward" | "backward"): void {
+    if (this.selection.size === 0) return;
+    const sel = this.selection;
+    this.mutate(() => {
+      const layerSeqs = new Map<string, GItem[]>();
+      const orphans: GItem[] = [];
+      for (const l of this.doc.layers) layerSeqs.set(l.id, []);
+      for (const it of this.doc.items) (layerSeqs.get(it.layer) ?? orphans).push(it);
+
+      const reorder = (seq: GItem[]): GItem[] => {
+        const picked = seq.filter((i) => sel.has(i.id));
+        if (!picked.length) return seq;
+        const rest = seq.filter((i) => !sel.has(i.id));
+        if (mode === "front") return [...rest, ...picked]; // last = on top
+        if (mode === "back") return [...picked, ...rest];
+        const out = [...seq];
+        if (mode === "forward") {
+          for (let i = out.length - 2; i >= 0; i--) {
+            if (sel.has(out[i].id) && !sel.has(out[i + 1].id)) {
+              [out[i], out[i + 1]] = [out[i + 1], out[i]];
+            }
+          }
+        } else {
+          for (let i = 1; i < out.length; i++) {
+            if (sel.has(out[i].id) && !sel.has(out[i - 1].id)) {
+              [out[i], out[i - 1]] = [out[i - 1], out[i]];
+            }
+          }
+        }
+        return out;
+      };
+
+      const items: GItem[] = [];
+      for (const l of this.doc.layers) items.push(...reorder(layerSeqs.get(l.id)!));
+      items.push(...orphans);
+      this.doc.items = items;
+    });
+  }
+
+  /** Make Row / Make Column (legacy Arrange): line the selected nodes up
+   *  adjacent to each other, centers aligned on the cross axis. */
+  makeRowOrColumn(axis: "row" | "column"): void {
+    const nodes = this.selectedNodes();
+    if (nodes.length < 2) return;
+    const sorted = [...nodes].sort((a, b) =>
+      axis === "row" ? a.x + a.w / 2 - (b.x + b.w / 2) : a.y + a.h / 2 - (b.y + b.h / 2),
+    );
+    let center = 0;
+    for (const n of sorted) center += axis === "row" ? n.y + n.h / 2 : n.x + n.w / 2;
+    center /= sorted.length;
+    this.mutate(() => {
+      let cursor = axis === "row" ? sorted[0].x : sorted[0].y;
+      for (const n of sorted) {
+        if (axis === "row") {
+          n.x = cursor;
+          n.y = center - n.h / 2;
+          cursor += n.w;
+        } else {
+          n.y = cursor;
+          n.x = center - n.w / 2;
+          cursor += n.h;
+        }
+      }
+    });
+  }
+
+  /** Distribute the selected nodes with equal gaps between their edges;
+   *  the outermost two stay where they are. */
+  distributeSelection(axis: "h" | "v"): void {
+    const nodes = this.selectedNodes();
+    if (nodes.length < 3) return;
+    const sorted = [...nodes].sort((a, b) =>
+      axis === "h" ? a.x + a.w / 2 - (b.x + b.w / 2) : a.y + a.h / 2 - (b.y + b.h / 2),
+    );
+    const first = sorted[0];
+    const last = sorted[sorted.length - 1];
+    const span =
+      axis === "h" ? last.x + last.w - first.x : last.y + last.h - first.y;
+    let sizes = 0;
+    for (const n of sorted) sizes += axis === "h" ? n.w : n.h;
+    const gap = (span - sizes) / (sorted.length - 1);
+    this.mutate(() => {
+      let cursor = (axis === "h" ? first.x + first.w : first.y + first.h) + gap;
+      for (const n of sorted.slice(1, -1)) {
+        if (axis === "h") {
+          n.x = cursor;
+          cursor += n.w + gap;
+        } else {
+          n.y = cursor;
+          cursor += n.h + gap;
         }
       }
     });
@@ -956,6 +1085,78 @@ export class Editor {
     });
   }
 
+  // ---------- inline images (Format > Image) ----------
+
+  /** Selected nodes that carry an inline image block. */
+  imageNodes(): GNode[] {
+    return this.selectedNodes().filter((n) => n.image != null);
+  }
+
+  /** After an image display-size change: shrink the node back around its
+   *  content (layoutContainers only grows widths, so reset first). */
+  private refitImageNode(n: GNode): void {
+    if (!n.image) return;
+    const hasKids = childrenOf(this.doc, n.id).length > 0;
+    if (!n.label && !hasKids) return; // layout sets the frame to the image exactly
+    const min = autoSizeFor(n.label, n.font);
+    n.w = Math.max(min.w, n.image.hidden ? 0 : n.image.w + CHILD_PAD_X * 2);
+    n.h = 10; // layout recomputes the height from content
+  }
+
+  /** Scale the image display box of every selected image node (undoable). */
+  imageScale(factor: number): void {
+    const targets = this.imageNodes();
+    if (!targets.length) return;
+    this.mutate(() => {
+      for (const n of targets) {
+        n.image!.w = Math.max(16, n.image!.w * factor);
+        n.image!.h = Math.max(16, n.image!.h * factor);
+        this.refitImageNode(n);
+      }
+    });
+  }
+
+  /** Set the image display box to the bitmap's natural pixel size (undoable). */
+  imageNaturalSize(): void {
+    const targets = this.imageNodes().filter((n) => n.image!.naturalW && n.image!.naturalH);
+    if (!targets.length) return;
+    this.mutate(() => {
+      for (const n of targets) {
+        n.image!.w = n.image!.naturalW!;
+        n.image!.h = n.image!.naturalH!;
+        this.refitImageNode(n);
+      }
+    });
+  }
+
+  /** Size preset: set the display width, keep the aspect ratio (undoable). */
+  imagePresetWidth(px: number): void {
+    const targets = this.imageNodes();
+    if (!targets.length) return;
+    this.mutate(() => {
+      for (const n of targets) {
+        const img = n.image!;
+        const aspect =
+          img.naturalW && img.naturalH ? img.naturalH / img.naturalW : img.h / Math.max(1, img.w);
+        img.w = px;
+        img.h = Math.max(16, Math.round(px * aspect));
+        this.refitImageNode(n);
+      }
+    });
+  }
+
+  /** Hide/show the inline image on every selected image node (undoable). */
+  setImageHidden(hidden: boolean): void {
+    const targets = this.imageNodes().filter((n) => n.image!.hidden !== hidden);
+    if (!targets.length) return;
+    this.mutate(() => {
+      for (const n of targets) {
+        n.image!.hidden = hidden;
+        this.refitImageNode(n);
+      }
+    });
+  }
+
   /** Rename = open the existing inline label editor on the single selected item. */
   renameSelection(): void {
     const sel = [...this.selection];
@@ -965,10 +1166,11 @@ export class Editor {
   duplicateSelection(): void {
     if (this.selection.size === 0) return;
     const idMap = new Map<string, string>();
+    const withKids = expandWithDescendants(this.doc, this.selection);
     this.mutate(() => {
       const clones: GItem[] = [];
       for (const it of this.doc.items) {
-        if (!this.selection.has(it.id)) continue;
+        if (!withKids.has(it.id)) continue;
         const clone = structuredClone(it);
         clone.id = allocId(this.doc);
         idMap.set(it.id, clone.id);
@@ -983,11 +1185,15 @@ export class Editor {
         }
         clones.push(clone);
       }
-      // remap duplicated links: keep connections when the endpoint was also duplicated, else detach
+      // remap duplicated links (keep connections when the endpoint was also
+      // duplicated, else detach) and containment parents
       for (const c of clones) {
-        if (c.kind !== "link") continue;
-        c.head.node = c.head.node ? idMap.get(c.head.node) ?? null : null;
-        c.tail.node = c.tail.node ? idMap.get(c.tail.node) ?? null : null;
+        if (c.kind === "link") {
+          c.head.node = c.head.node ? idMap.get(c.head.node) ?? null : null;
+          c.tail.node = c.tail.node ? idMap.get(c.tail.node) ?? null : null;
+        } else {
+          c.parent = c.parent ? idMap.get(c.parent) ?? null : null;
+        }
       }
       this.doc.items.push(...clones);
       // duplicated whole groups stay grouped
@@ -1003,8 +1209,10 @@ export class Editor {
     this.mutate(() => this.translateItems(this.selection, dx, dy));
   }
 
-  /** Move nodes; move link free-endpoints/controls when the link is selected or both its endpoints move. */
-  private translateItems(ids: Set<string>, dx: number, dy: number): void {
+  /** Move nodes (children ride along with their parent); move link
+   *  free-endpoints/controls when the link is selected or both its endpoints move. */
+  private translateItems(rawIds: Set<string>, dx: number, dy: number): void {
+    const ids = expandWithDescendants(this.doc, rawIds);
     for (const it of this.doc.items) {
       if (it.kind === "node" && ids.has(it.id)) {
         it.x += dx;
@@ -1230,10 +1438,9 @@ export class Editor {
       const src = this.hitNode(w);
       if (src) {
         this.drag = { kind: "linkDraw", sourceId: src.id, curW: w, targetId: null, startS: s, combo: tool === "combo" };
-      } else if (tool === "combo") {
-        // combo tool on blank canvas creates a node right there (legacy VUE-1597)
-        this.createNodeAt(w.x, w.y);
       }
+      // single click on blank canvas creates nothing (node creation is
+      // double-click in every mode) — it just committed any label edit above
       return;
     }
 
@@ -1261,14 +1468,20 @@ export class Editor {
       case "maybeMove": {
         if (Math.abs(e.clientX - d.startS.x) < DRAG_START_PX && Math.abs(e.clientY - d.startS.y) < DRAG_START_PX) return;
         this.history.checkpoint(this.doc);
+        // children ride along with dragged parents
+        const draggedIds = expandWithDescendants(this.doc, this.selection);
         const orig = new Map<string, { x: number; y: number }>();
         const origLinks = new Map<string, GLink>();
         for (const it of this.doc.items) {
-          if (!this.selection.has(it.id)) continue;
-          if (it.kind === "node") orig.set(it.id, { x: it.x, y: it.y });
-          else origLinks.set(it.id, structuredClone(it));
+          if (it.kind === "node") {
+            if (draggedIds.has(it.id)) orig.set(it.id, { x: it.x, y: it.y });
+          } else {
+            // snapshot every link: translateItems can move controls of links
+            // whose endpoints both ride along even when the link isn't selected
+            origLinks.set(it.id, structuredClone(it));
+          }
         }
-        this.drag = { kind: "move", startW: d.startW, orig, origLinks, moved: false };
+        this.drag = { kind: "move", startW: d.startW, orig, origLinks, moved: false, draggedIds, dropTarget: null };
         this.pointerMove(e);
         return;
       }
@@ -1285,6 +1498,8 @@ export class Editor {
           }
         }
         this.translateItems(this.selection, dx, dy);
+        // drop-onto-node containment target (only when nodes are being dragged)
+        d.dropTarget = d.orig.size > 0 ? this.findDropTarget(w, d.draggedIds) : null;
         d.moved = true;
         this.dirty = true;
         this.render();
@@ -1378,7 +1593,13 @@ export class Editor {
         return;
       }
       case "move": {
-        if (d.moved) this.onChange();
+        if (d.moved) {
+          this.resolveDropContainment(d.dropTarget, d.draggedIds);
+          layoutContainers(this.doc);
+          this.dirty = true;
+          this.render();
+          this.onChange();
+        }
         return;
       }
       case "marquee": {
@@ -1407,10 +1628,9 @@ export class Editor {
           });
           const id = [...this.selection][0];
           this.startLabelEdit(id, true);
-        } else {
-          // click: create a default auto-sized node at the click point
-          this.createNodeAt(d.startW.x, d.startW.y);
         }
+        // plain click: no node — creation is double-click in every mode, so a
+        // single click only escapes an active label edit / lets modes change
         return;
       }
       case "linkDraw": {
@@ -1463,7 +1683,11 @@ export class Editor {
         return;
       }
       case "resize": {
-        if (d.moved) this.onChange();
+        if (d.moved) {
+          layoutContainers(this.doc); // clamp to content, re-wrap children
+          this.render();
+          this.onChange();
+        }
         return;
       }
       case "endpoint": {
@@ -1487,12 +1711,21 @@ export class Editor {
   }
 
   private doubleClick(e: MouseEvent): void {
-    if (this.effectiveTool() !== "select") return;
+    const tool = this.effectiveTool();
     const w = this.screenToWorld(e.clientX, e.clientY);
     const hit = this.hitTest(w);
     if (hit) {
-      this.selection = new Set([hit.id]);
-      this.startLabelEdit(hit.id);
+      // double-click an item (select mode): edit its label
+      if (tool === "select") {
+        this.selection = new Set([hit.id]);
+        this.startLabelEdit(hit.id);
+      }
+      return;
+    }
+    // double-click on empty canvas creates a node in select/node/link/rapid
+    // modes (single click never creates — it escapes label edits instead)
+    if (tool === "select" || tool === "node" || tool === "link" || tool === "combo") {
+      this.createNodeAt(w.x, w.y);
     }
   }
 
@@ -1517,6 +1750,7 @@ export class Editor {
   // ---------- keyboard ----------
 
   private keyDown(e: KeyboardEvent): void {
+    if (this.container.offsetParent === null) return; // inactive tab (display:none)
     if (this.labelBox) return; // label editor handles its own keys
     const target = e.target as HTMLElement;
     if (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT") return;
@@ -1649,10 +1883,26 @@ export class Editor {
     this.labelBox = box;
 
     const commit = () => this.commitLabelEdit();
+    // grow the box with its content so multi-line labels stay editable
+    const autoGrow = () => {
+      box.style.height = "auto";
+      box.style.height = `${Math.max(26, box.scrollHeight)}px`;
+    };
+    autoGrow();
+    box.addEventListener("input", autoGrow);
     box.addEventListener("blur", commit);
     box.addEventListener("keydown", (e) => {
       e.stopPropagation();
-      if (e.key === "Enter" && !e.shiftKey) {
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+        // Ctrl+Return: insert a newline at the caret
+        e.preventDefault();
+        const start = box.selectionStart ?? box.value.length;
+        const end = box.selectionEnd ?? start;
+        box.value = box.value.slice(0, start) + "\n" + box.value.slice(end);
+        box.selectionStart = box.selectionEnd = start + 1;
+        autoGrow();
+      } else if (e.key === "Enter" && !e.shiftKey) {
+        // Return: finish and exit the editor
         e.preventDefault();
         commit();
       } else if (e.key === "Escape") {
@@ -1746,6 +1996,34 @@ export class Editor {
     return out;
   }
 
+  // ---------- containment (drag onto a node = becomes its child) ----------
+
+  /** Topmost node under the pointer that isn't part of the dragged subtree —
+   *  the candidate drop parent, highlighted during the drag. */
+  private findDropTarget(w: Pt, exclude: ReadonlySet<string>): string | null {
+    const order = paintOrder(this.doc);
+    for (let i = order.length - 1; i >= 0; i--) {
+      const it = order[i];
+      if (it.kind !== "node" || exclude.has(it.id)) continue;
+      if (!this.itemSelectable(it)) continue;
+      if (w.x >= it.x && w.x <= it.x + it.w && w.y >= it.y && w.y <= it.y + it.h && pointInOutline(w, nodeOutline(it)))
+        return it.id;
+    }
+    return null;
+  }
+
+  /** After a move drop: attach dragged root nodes to the drop target, or detach
+   *  them when dropped on empty canvas outside any node. */
+  private resolveDropContainment(targetId: string | null, draggedIds: ReadonlySet<string>): void {
+    const roots = this.selectedNodes().filter((n) => n.parent == null || !draggedIds.has(n.parent));
+    if (!roots.length) return;
+    if (targetId != null && !draggedIds.has(targetId)) {
+      for (const n of roots) attachChild(this.doc, n.id, targetId);
+    } else if (targetId == null) {
+      for (const n of roots) n.parent = null; // dragged out onto the canvas
+    }
+  }
+
   /** Resize handles (single selected node) and link endpoint/control handles (single selected link). */
   private hitHandle(w: Pt): Drag | null {
     if (this.selection.size !== 1) return null;
@@ -1790,12 +2068,24 @@ export class Editor {
     n.w = right - x;
     n.h = bottom - y;
     n.autoSized = false;
+    // resizing an image-bearing node rescales its image display box
+    if (n.image) {
+      const hasKids = childrenOf(this.doc, n.id).length > 0;
+      if (!n.label && !hasKids) {
+        n.image.w = n.w;
+        n.image.h = n.h;
+      } else if (!hasKids) {
+        n.image.w = Math.max(16, n.w - CHILD_PAD_X * 2);
+        n.image.h = Math.max(16, n.h - labelBlockHeight(n) - CHILD_PAD_BOTTOM);
+      }
+    }
   }
 
   // ---------- rendering ----------
 
   render(): void {
     this.pruneSet = this.showPruning ? pruneHiddenIds(this.doc) : EMPTY_SET;
+    this.collapseSet = collapseHiddenIds(this.doc);
     this.svg.style.background = this.doc.background;
     this.world.setAttribute("transform", `translate(${this.panX},${this.panY}) scale(${this.zoom})`);
     this.itemsG.replaceChildren();
@@ -1823,13 +2113,64 @@ export class Editor {
     }
     g.appendChild(path);
 
-    if (n.label && this.editingId !== n.id) {
-      g.appendChild(this.renderText(n.label, n.x + n.w / 2, n.y + n.h / 2, n.font, n.textColor, "middle"));
+    const kids = childrenOf(this.doc, n.id);
+    const hasVisibleKids = kids.some((k) => !k.hidden) && !n.collapsed;
+
+    // inline image: fills the area below the label (whole node when label-less)
+    const box = imageBox(n, kids.length > 0);
+    if (box) {
+      const spec = n.resource && isImageResource(n.resource) ? n.resource.spec : null;
+      const href = spec ? this.imageHref(spec) : null;
+      if (spec && href && !this.brokenImages.has(spec)) {
+        const im = el("image");
+        im.setAttribute("x", String(box.x));
+        im.setAttribute("y", String(box.y));
+        im.setAttribute("width", String(box.w));
+        im.setAttribute("height", String(box.h));
+        im.setAttribute("href", href);
+        im.setAttribute("preserveAspectRatio", "xMidYMid meet");
+        im.addEventListener("error", () => {
+          if (!this.brokenImages.has(spec)) {
+            this.brokenImages.add(spec);
+            this.render(); // swap in the placeholder
+          }
+        });
+        g.appendChild(im);
+      } else {
+        g.appendChild(imagePlaceholder(box, spec ?? "(no image file)"));
+      }
     }
-    // small corner glyphs: attachment (top-right), notes (bottom-right)
-    if (n.resource) g.appendChild(badge(n.x + n.w - 5, n.y + 5, "resource", n.resource.spec));
-    if (n.notes) g.appendChild(badge(n.x + n.w - 5, n.y + n.h - 5, "note", n.notes));
+
+    if (n.label && this.editingId !== n.id) {
+      // label sits at the top when the node has visible content below it
+      const labelY = box || hasVisibleKids ? n.y + labelBlockHeight(n) / 2 : n.y + n.h / 2;
+      g.appendChild(this.renderText(n.label, n.x + n.w / 2, labelY, n.font, n.textColor, "middle"));
+    }
+    // collapsed parent: small "+N" marker (N = hidden direct children)
+    if (n.collapsed && kids.length) {
+      g.appendChild(collapseMarker(n.x + n.w - 9, n.y + n.h - 8, kids.length));
+    }
+    // small corner glyphs: attachment (top-right), notes (bottom-right) —
+    // offset a bit further in from the corner than the old r=3 glyph needed,
+    // so the larger r=6 badge doesn't poke outside the node's edge
+    if (n.resource) g.appendChild(badge(n.x + n.w - 8, n.y + 8, "resource", n.resource.spec, () => this.activateBadge(n.id, "resource")));
+    if (n.notes) g.appendChild(badge(n.x + n.w - 8, n.y + n.h - 8, "note", n.notes, () => this.activateBadge(n.id, "note")));
     this.itemsG.appendChild(g);
+  }
+
+  /** Renderable URL for an image resource spec: http(s) passes through, local
+   *  paths go through Tauri's asset protocol, browser dev gets null (placeholder). */
+  private imageHref(spec: string): string | null {
+    if (/^https?:\/\//i.test(spec)) return spec;
+    if (/^(data|blob|asset):/i.test(spec)) return spec;
+    if (isTauri()) {
+      try {
+        return convertFileSrc(spec);
+      } catch {
+        return null;
+      }
+    }
+    return null;
   }
 
   private renderLink(l: GLink): void {
@@ -1883,9 +2224,30 @@ export class Editor {
       g.appendChild(bg);
       g.appendChild(this.renderText(l.label, geo.mid.x, geo.mid.y, l.font, l.textColor, "middle"));
     }
-    if (l.resource) g.appendChild(badge(geo.mid.x + 9, geo.mid.y - 9, "resource", l.resource.spec));
-    if (l.notes) g.appendChild(badge(geo.mid.x + 9, geo.mid.y + 9, "note", l.notes));
+    if (l.resource) g.appendChild(badge(geo.mid.x + 9, geo.mid.y - 9, "resource", l.resource.spec, () => this.activateBadge(l.id, "resource")));
+    if (l.notes) g.appendChild(badge(geo.mid.x + 9, geo.mid.y + 9, "note", l.notes, () => this.activateBadge(l.id, "note")));
     this.itemsG.appendChild(g);
+  }
+
+  /** Badge click (attachment dot / note dog-ear): select the item, then act —
+   *  open the attachment or the notes editor (same as the context-menu Notes
+   *  command). The badge's own pointerdown handler stops propagation before
+   *  this runs, so the click never starts a drag or marquee. */
+  private activateBadge(itemId: string, kind: "resource" | "note"): void {
+    const it = this.doc.items.find((i) => i.id === itemId);
+    if (!it) return;
+    this.selection = new Set([itemId]);
+    this.render();
+    if (kind === "resource") {
+      if (it.resource) openAttachment(it.resource.spec);
+    } else {
+      const name = it.label.trim() || (it.kind === "node" ? "node" : "link");
+      openNotesEditor({
+        title: `Notes — ${name}`,
+        initial: it.notes,
+        onSave: (text) => this.setNotes(it.id, text),
+      });
+    }
   }
 
   private arrowHead(tip: Pt, from: Pt, l: GLink): SVGElement {
@@ -1944,6 +2306,8 @@ export class Editor {
       if (this.drag.targetId) this.highlightNode(this.drag.targetId);
     }
     if (this.drag.kind === "endpoint" && this.drag.targetId) this.highlightNode(this.drag.targetId);
+    // drop-into-node containment highlight while moving nodes
+    if (this.drag.kind === "move" && this.drag.dropTarget) this.highlightNode(this.drag.dropTarget);
 
     // selection chrome
     for (const id of this.selection) {
@@ -2096,28 +2460,105 @@ function el(name: string): SVGElement {
   return document.createElementNS("http://www.w3.org/2000/svg", name);
 }
 
-/** Small corner glyph marking an attachment (blue dot) or note (amber dog-ear). */
-function badge(cx: number, cy: number, kind: "resource" | "note", tip: string): SVGElement {
+/** Small corner glyph marking an attachment (blue dot) or note (amber dog-ear).
+ *  Clickable: an invisible hit circle (larger than the visible glyph) carries
+ *  its own pointerdown handler that stops propagation before the editor's
+ *  central pointerDown ever sees the event, so a badge click can never start
+ *  a drag or marquee. */
+function badge(cx: number, cy: number, kind: "resource" | "note", tip: string, onActivate: () => void): SVGElement {
   const g = el("g");
+  g.style.cursor = "pointer";
   if (kind === "resource") {
     const c = el("circle");
     c.setAttribute("cx", String(cx));
     c.setAttribute("cy", String(cy));
-    c.setAttribute("r", "3");
+    c.setAttribute("r", "6");
     c.setAttribute("fill", "#4A95FF");
     c.setAttribute("stroke", "#ffffff");
-    c.setAttribute("stroke-width", "0.75");
+    c.setAttribute("stroke-width", "1");
     g.appendChild(c);
   } else {
     const t = el("path");
-    t.setAttribute("d", `M${cx - 3},${cy + 3} L${cx + 3},${cy + 3} L${cx + 3},${cy - 3} Z`);
+    t.setAttribute("d", `M${cx - 6},${cy + 6} L${cx + 6},${cy + 6} L${cx + 6},${cy - 6} Z`);
     t.setAttribute("fill", "#F2C94C");
     t.setAttribute("stroke", "#A8861D");
-    t.setAttribute("stroke-width", "0.6");
+    t.setAttribute("stroke-width", "1");
     g.appendChild(t);
   }
+  const hit = el("circle");
+  hit.setAttribute("cx", String(cx));
+  hit.setAttribute("cy", String(cy));
+  hit.setAttribute("r", "9");
+  hit.setAttribute("fill", "transparent");
+  hit.setAttribute("pointer-events", "all");
+  hit.addEventListener("pointerdown", (e) => {
+    e.stopPropagation();
+    onActivate();
+  });
+  g.appendChild(hit);
   const title = el("title");
-  title.textContent = kind === "resource" ? `Attachment: ${tip}` : `Notes: ${tip.length > 120 ? tip.slice(0, 120) + "…" : tip}`;
+  title.textContent = kind === "resource" ? `Attachment: ${tip} (click to open)` : `Notes: ${tip.length > 120 ? tip.slice(0, 120) + "…" : tip} (click to edit)`;
+  g.appendChild(title);
+  return g;
+}
+
+/** Gray box + filename shown when an image can't be rendered (browser dev,
+ *  missing file, unreadable path). */
+function imagePlaceholder(box: { x: number; y: number; w: number; h: number }, spec: string): SVGElement {
+  const g = el("g");
+  const r = el("rect");
+  r.setAttribute("x", String(box.x));
+  r.setAttribute("y", String(box.y));
+  r.setAttribute("width", String(box.w));
+  r.setAttribute("height", String(box.h));
+  r.setAttribute("fill", "#d9d9d9");
+  r.setAttribute("stroke", "#999999");
+  r.setAttribute("stroke-width", "1");
+  g.appendChild(r);
+  const i = Math.max(spec.lastIndexOf("/"), spec.lastIndexOf("\\"));
+  let name = i >= 0 ? spec.slice(i + 1) : spec;
+  if (name.length > 28) name = name.slice(0, 27) + "…";
+  const t = el("text");
+  t.setAttribute("x", String(box.x + box.w / 2));
+  t.setAttribute("y", String(box.y + box.h / 2));
+  t.setAttribute("text-anchor", "middle");
+  t.setAttribute("fill", "#666666");
+  t.style.font = '10px "Arial", sans-serif';
+  t.style.userSelect = "none";
+  t.textContent = name;
+  g.appendChild(t);
+  const title = el("title");
+  title.textContent = `Image not available: ${spec}`;
+  g.appendChild(title);
+  return g;
+}
+
+/** "+N" chip on a collapsed parent (N = direct children hidden inside). */
+function collapseMarker(cx: number, cy: number, count: number): SVGElement {
+  const g = el("g");
+  const label = `+${count}`;
+  const w = 10 + label.length * 5;
+  const r = el("rect");
+  r.setAttribute("x", String(cx - w / 2));
+  r.setAttribute("y", String(cy - 6));
+  r.setAttribute("width", String(w));
+  r.setAttribute("height", "12");
+  r.setAttribute("rx", "6");
+  r.setAttribute("fill", "#ffffff");
+  r.setAttribute("stroke", "#7f7f7f");
+  r.setAttribute("stroke-width", "0.75");
+  g.appendChild(r);
+  const t = el("text");
+  t.setAttribute("x", String(cx));
+  t.setAttribute("y", String(cy + 3));
+  t.setAttribute("text-anchor", "middle");
+  t.setAttribute("fill", "#4c4c4c");
+  t.style.font = 'bold 9px "Arial", sans-serif';
+  t.style.userSelect = "none";
+  t.textContent = label;
+  g.appendChild(t);
+  const title = el("title");
+  title.textContent = `Collapsed: ${count} hidden child${count === 1 ? "" : "ren"}`;
   g.appendChild(title);
   return g;
 }

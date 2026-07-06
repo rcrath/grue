@@ -18,6 +18,69 @@ body,
   flex-direction: column;
 }
 
+/* ---------- document tabs ---------- */
+
+#tabbar {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  padding: 4px 6px 0;
+  background: #e3e3e3;
+  border-bottom: 1px solid #c9c9c9;
+  user-select: none;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+#tabbar .tab {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 4px 4px 10px;
+  border: 1px solid #c9c9c9;
+  border-bottom: none;
+  border-radius: 5px 5px 0 0;
+  background: #d6d6d6;
+  color: #444;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  max-width: 220px;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+#tabbar .tab:hover {
+  background: #e9e9e9;
+}
+
+#tabbar .tab.active {
+  background: #fff;
+  color: #000;
+  border-color: #b5b5b5;
+}
+
+#tabbar .tab-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#tabbar .tab-close {
+  border: none;
+  background: none;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 1px 4px;
+  border-radius: 3px;
+  color: #666;
+}
+
+#tabbar .tab-close:hover {
+  background: #f3b0b0;
+  color: #600;
+}
+
 #toolbar {
   display: flex;
   align-items: center;
@@ -98,6 +161,17 @@ body,
   flex: 1;
   min-height: 0;
   position: relative;
+}
+
+/* one container per open document; only the active tab's is shown */
+.doc-canvas {
+  position: absolute;
+  inset: 0;
+  display: none;
+}
+
+.doc-canvas.active {
+  display: block;
 }
 
 #canvas svg {
@@ -261,6 +335,68 @@ body,
   word-break: break-word;
   max-height: 110px;
   overflow-y: auto;
+}
+
+/* ---------- log panel (Help > Show Log) ---------- */
+
+.panel-log {
+  width: 380px;
+}
+
+.log-list {
+  max-height: 45vh;
+  overflow-y: auto;
+  background: #fff;
+  border: 1px solid #e2e2e2;
+  border-radius: 3px;
+  padding: 4px 6px;
+  font-family: Consolas, Menlo, monospace;
+  font-size: 11.5px;
+}
+
+.log-row {
+  white-space: pre-wrap;
+  word-break: break-word;
+  padding: 1px 0;
+  border-bottom: 1px solid #f2f2f2;
+}
+
+.log-row.log-warn {
+  color: #a8720d;
+}
+
+.log-row.log-error {
+  color: #c0392b;
+}
+
+/* ---------- status-bar error indicator ---------- */
+
+.status-log {
+  cursor: pointer;
+  color: #c0392b;
+  font-weight: 600;
+}
+
+/* ---------- toast (brief bottom-of-screen message) ---------- */
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 34px;
+  transform: translateX(-50%);
+  background: #333;
+  color: #fff;
+  padding: 6px 14px;
+  border-radius: 4px;
+  font-size: 12.5px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
+  z-index: 1000;
+  opacity: 1;
+  transition: opacity 0.3s ease;
+}
+
+.toast-out {
+  opacity: 0;
 }
 
 .panel-row {
@@ -643,6 +779,11 @@ body,
 .dlg-title {
   font-weight: 600;
   margin-bottom: 10px;
+}
+
+.dlg-text {
+  margin: 4px 0 2px;
+  color: #333;
 }
 
 .dlg-label {

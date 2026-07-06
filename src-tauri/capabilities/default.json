@@ -1,19 +1,27 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Main window capabilities: file open/save dialogs and text file read/write for user-chosen map files.",
+  "description": "Main window capabilities: file open/save dialogs, text file read/write for user-chosen map files, existence checks for image path resolution, opening attachments in their default app.",
   "windows": ["main"],
   "permissions": [
     "core:default",
+    "core:window:allow-destroy",
+    "core:window:allow-close",
+    "core:window:allow-set-title",
     "dialog:default",
     "fs:default",
     "opener:allow-open-url",
+    "opener:allow-open-path",
     {
       "identifier": "fs:allow-read-text-file",
       "allow": [{ "path": "**" }]
     },
     {
       "identifier": "fs:allow-write-text-file",
+      "allow": [{ "path": "**" }]
+    },
+    {
+      "identifier": "fs:allow-exists",
       "allow": [{ "path": "**" }]
     }
   ]

@@ -2,8 +2,8 @@
 // Format spec extracted from the legacy source: docs/legacy-specs/format.md.
 
 import {
-  GDoc, GFont, GLayer, GLink, GNode, GResource, LinkEnd, NodeShape,
-  LINK_DEFAULTS, NODE_DEFAULTS, newDoc, paintOrder,
+  GDoc, GFont, GGroup, GImage, GLayer, GLink, GNode, GResource, LinkEnd, NodeShape,
+  LINK_DEFAULTS, NODE_DEFAULTS, imageBox, newDoc, paintOrder,
 } from "./model";
 
 // ---- codecs ----
@@ -196,59 +196,169 @@ export function importVue(text: string): VueImportResult {
 
   // Old→new id mapping is identity (legacy ids are numeric strings) but guard dupes.
   const seenIds = new Set<string>();
-  const pendingLinks: { el: Element; ox: number; oy: number; layerId: string }[] = [];
+  const pendingLinks: { el: Element; ox: number; oy: number; layerId: string; bag: string[] | null }[] = [];
+  // legacy groups → grue flat membership sets (outermost group wins; nested
+  // group elements pour their members into the enclosing group's bag)
+  const pendingGroups: { id: string; members: string[] }[] = [];
+  // image children merged into their parent node: old image id → parent node id
+  // (kept so links that targeted the image still resolve)
+  const imageIdMap = new Map<string, string>();
 
-  const importChildren = (parent: Element, ox: number, oy: number, scale: number, layerId: string | null) => {
+  const importChildren = (
+    parent: Element,
+    ox: number,
+    oy: number,
+    parentNode: GNode | null,
+    layerId: string | null,
+    bag: string[] | null,
+  ) => {
     for (const el of Array.from(parent.children)) {
       if (el.tagName === "layer") {
-        // layers sit at 0,0 scale 1; their children are map coordinates
-        importChildren(el, 0, 0, 1, el.getAttribute("ID"));
+        // layers sit at 0,0; their children are map coordinates
+        importChildren(el, 0, 0, null, el.getAttribute("ID"), null);
         continue;
       }
       if (el.tagName !== "child") continue;
       const t = (el.getAttribute("xsi:type") || el.getAttributeNS("http://www.w3.org/2001/XMLSchema-instance", "type") || "").toLowerCase();
       if (t === "link") {
-        pendingLinks.push({ el, ox, oy, layerId: layerFor(el, layerId) });
+        const id = el.getAttribute("ID");
+        if (id) bag?.push(id);
+        pendingLinks.push({ el, ox, oy, layerId: layerFor(el, layerId), bag });
         continue;
       }
       if (t === "node" || t === "text" || t === "") {
-        const n = importNode(el, ox, oy, scale, t === "text");
+        const n = importNode(el, ox, oy, t === "text");
         if (n) {
           if (seenIds.has(n.id)) {
             warnings.push(`Duplicate id ${n.id}; skipped a component.`);
             continue;
           }
           n.layer = layerFor(el, layerId);
+          n.parent = parentNode ? parentNode.id : null;
           seenIds.add(n.id);
+          bag?.push(n.id);
           doc.items.push(n);
-          // nested children (nodes inside nodes): flatten, scaled 75% per level
-          importChildren(
-            el,
-            relativeCoords ? n.x : 0,
-            relativeCoords ? n.y : 0,
-            scale * 0.75,
-            n.layer || layerId,
-          );
+          // nested children (nodes inside nodes): REAL containment — child
+          // coordinates in the file are parent-relative (modelVersion >= 1);
+          // no 0.75 flatten-scaling anymore. Descendants aren't group members
+          // (they already move with their parent).
+          importChildren(el, relativeCoords ? n.x : 0, relativeCoords ? n.y : 0, n, n.layer || layerId, null);
         }
+        continue;
+      }
+      if (t === "image") {
+        importImage(el, ox, oy, parentNode, layerId, bag);
         continue;
       }
       if (t === "group") {
         const gx = parseFloat(el.getAttribute("x") || "0") || 0;
         const gy = parseFloat(el.getAttribute("y") || "0") || 0;
-        importChildren(el, relativeCoords ? ox + gx : 0, relativeCoords ? oy + gy : 0, scale, layerFor(el, layerId));
+        let nextBag = bag;
+        if (!parentNode && bag == null) {
+          // outermost group: collect direct+nested members into one flat set
+          const gid = el.getAttribute("ID");
+          if (gid) {
+            const g = { id: gid, members: [] as string[] };
+            pendingGroups.push(g);
+            nextBag = g.members;
+          }
+        }
+        importChildren(
+          el,
+          relativeCoords ? ox + gx : 0,
+          relativeCoords ? oy + gy : 0,
+          parentNode,
+          layerFor(el, layerId),
+          nextBag,
+        );
         continue;
       }
       warnings.push(`Skipped unsupported component type "${t || "unknown"}".`);
     }
   };
 
-  const importNode = (el: Element, ox: number, oy: number, scale: number, isText: boolean): GNode | null => {
+  /** Legacy xsi:type="image" child. Inside a node it becomes the parent node's
+   *  inline image display (Rich's rule: an image is a node with an image
+   *  resource — no separate image component). Top-level (or when the parent
+   *  already carries a different resource or image) it becomes a standalone
+   *  label-less image node. */
+  const importImage = (
+    el: Element,
+    ox: number,
+    oy: number,
+    parentNode: GNode | null,
+    layerId: string | null,
+    bag: string[] | null,
+  ) => {
+    const id = el.getAttribute("ID");
+    const res = importResource(el);
+    const w = Math.max(4, parseFloat(el.getAttribute("width") || "0") || 64);
+    const h = Math.max(4, parseFloat(el.getAttribute("height") || "0") || 64);
+    const prop = (key: string): number | null => {
+      const v = res?.properties.find((p) => p.key === key)?.value;
+      const n = v != null ? parseFloat(v) : NaN;
+      return Number.isFinite(n) && n > 0 ? n : null;
+    };
+    const img: GImage = {
+      w, h,
+      naturalW: prop("image.width"),
+      naturalH: prop("image.height"),
+      hidden: el.getAttribute("hidden") === "true",
+    };
+    if (
+      parentNode &&
+      parentNode.image == null &&
+      (parentNode.resource == null || (res != null && parentNode.resource.spec === res.spec))
+    ) {
+      // the image renders inside the parent node itself
+      parentNode.image = img;
+      if (parentNode.resource == null && res) parentNode.resource = res;
+      if (id) imageIdMap.set(id, parentNode.id);
+      return;
+    }
+    if (!id) {
+      warnings.push("Image without an ID; skipped.");
+      return;
+    }
+    if (seenIds.has(id)) {
+      warnings.push(`Duplicate id ${id}; skipped a component.`);
+      return;
+    }
+    const x = (parseFloat(el.getAttribute("x") || "0") || 0) + (relativeCoords ? ox : 0);
+    const y = (parseFloat(el.getAttribute("y") || "0") || 0) + (relativeCoords ? oy : 0);
+    const n: GNode = {
+      kind: "node",
+      id,
+      label: "",
+      x, y, w, h,
+      shape: "rect",
+      fill: null,
+      stroke: "#404040",
+      strokeWidth: 0,
+      strokeStyle: 0,
+      textColor: "#000000",
+      font: NODE_DEFAULTS.font(),
+      autoSized: false,
+      hidden: el.getAttribute("hidden") === "true",
+      collapsed: false,
+      layer: layerFor(el, layerId),
+      notes: importNotes(el),
+      resource: res,
+      parent: parentNode ? parentNode.id : null,
+      image: { ...img, hidden: false }, // node-level hidden covers the element flag
+    };
+    seenIds.add(id);
+    bag?.push(id);
+    doc.items.push(n);
+  };
+
+  const importNode = (el: Element, ox: number, oy: number, isText: boolean): GNode | null => {
     const id = el.getAttribute("ID");
     if (!id) return null;
-    const x = (parseFloat(el.getAttribute("x") || "0") || 0) * (relativeCoords ? scale : 1) + ox;
-    const y = (parseFloat(el.getAttribute("y") || "0") || 0) * (relativeCoords ? scale : 1) + oy;
-    const w = Math.max(10, (parseFloat(el.getAttribute("width") || "60") || 60) * scale);
-    const h = Math.max(10, (parseFloat(el.getAttribute("height") || "24") || 24) * scale);
+    const x = (parseFloat(el.getAttribute("x") || "0") || 0) + (relativeCoords ? ox : 0);
+    const y = (parseFloat(el.getAttribute("y") || "0") || 0) + (relativeCoords ? oy : 0);
+    const w = Math.max(10, parseFloat(el.getAttribute("width") || "60") || 60);
+    const h = Math.max(10, parseFloat(el.getAttribute("height") || "24") || 24);
 
     let shape: NodeShape = "roundRect";
     let shapeEl = directChild(el, "shape");
@@ -287,16 +397,20 @@ export function importVue(text: string): VueImportResult {
       layer: "", // assigned by the caller
       notes: importNotes(el),
       resource: importResource(el),
+      parent: null, // assigned by the caller
+      image: null,
     };
   };
 
-  importChildren(root, 0, 0, 1, null);
+  importChildren(root, 0, 0, null, null, null);
 
   for (const { el, ox, oy, layerId } of pendingLinks) {
     const id = el.getAttribute("ID");
     if (!id || seenIds.has(id)) continue;
-    const id1 = directChildText(el, "ID1");
-    const id2 = directChildText(el, "ID2");
+    // links that targeted an image child now target the node displaying it
+    const remap = (ref: string | null): string | null => (ref != null ? imageIdMap.get(ref) ?? ref : null);
+    const id1 = remap(directChildText(el, "ID1"));
+    const id2 = remap(directChildText(el, "ID2"));
     const p1 = pointOf(el, "point1", ox, oy);
     const p2 = pointOf(el, "point2", ox, oy);
     const mkEnd = (ref: string | null, pt: { x: number; y: number } | null): LinkEnd => {
@@ -342,6 +456,16 @@ export function importVue(text: string): VueImportResult {
     doc.items.push(link);
   }
 
+  // legacy groups → flat membership sets (2+ surviving members)
+  const grouped = new Set<string>();
+  for (const pg of pendingGroups) {
+    const members = pg.members.filter((m) => seenIds.has(m) && !grouped.has(m));
+    if (members.length < 2 || seenIds.has(pg.id)) continue;
+    for (const m of members) grouped.add(m);
+    const g: GGroup = { id: pg.id, members };
+    doc.groups.push(g);
+  }
+
   let maxId = 0;
   const bump = (sid: string) => {
     const n = parseInt(sid, 10);
@@ -349,6 +473,7 @@ export function importVue(text: string): VueImportResult {
   };
   for (const sid of seenIds) bump(sid);
   for (const l of layers) bump(l.id);
+  for (const g of doc.groups) bump(g.id);
 
   // pre-layer files (modelVersion < 5): one default layer holds everything
   if (layers.length === 0)
@@ -414,11 +539,12 @@ function pointOf(el: Element, tag: string, ox: number, oy: number): { x: number;
 
 // ---- export ----
 
-/** Minimal .vue writer: nodes + links + layer shells, modelVersion 5,
- *  mapping version 1.1 — loadable by legacy VUE. Children are written flat under
- *  LW-MAP grouped by layer (paint order) with layerID references, exactly like
- *  legacy VUE persists layered maps. All coordinates are absolute; that is safe
- *  because every exported component is a top-level child of a layer at 0,0. */
+/** .vue writer: nodes + links + nesting + images + groups + layer shells,
+ *  modelVersion 5, mapping version 1.1 — loadable by legacy VUE. Top-level
+ *  children sit flat under LW-MAP grouped by layer (paint order) with layerID
+ *  references; contained nodes nest inside their parent with parent-relative
+ *  coordinates, images become xsi:type="image" children, groups become
+ *  xsi:type="group" containers. */
 export function exportVue(doc: GDoc, mapLabel: string): string {
   const lines: string[] = [];
   lines.push(`<!-- Tufts VUE concept-map (${xmlEscape(mapLabel)}) -->`);
@@ -449,56 +575,164 @@ export function exportVue(doc: GDoc, mapLabel: string): string {
     pentagon: "pentagon",
   };
 
-  // Children flat under LW-MAP in global paint order (grouped by layer), each
-  // tagged with its layerID — the shape legacy VUE writes for layered maps.
-  for (const it of paintOrder(doc)) {
-    const layerRef = ` layerID="${xmlEscape(it.layer)}"`;
-    const hiddenAttr = it.hidden ? ` hidden="true"` : "";
-    if (it.kind === "node") {
-      lines.push(
-        `  <child ID="${xmlEscape(it.id)}" label="${xmlEscape(it.label)}"${layerRef} ` +
-          `x="${fx(it.x)}" y="${fx(it.y)}" width="${fx(it.w)}" height="${fx(it.h)}" ` +
-          `strokeWidth="${fx(it.strokeWidth)}"${it.strokeStyle ? ` strokeStyle="${it.strokeStyle}"` : ""} ` +
-          `autoSized="${it.autoSized}"${hiddenAttr} xsi:type="node">`,
-      );
-      if (it.notes) lines.push(`    <notes>${xmlEscape(escapeVueNotes(it.notes))}</notes>`);
-      lines.push(...resourceXml(it.resource));
-      const fill = toVueColor(it.fill);
-      if (fill) lines.push(`    <fillColor>${fill}</fillColor>`);
-      lines.push(`    <strokeColor>${toVueColor(it.stroke)}</strokeColor>`);
-      lines.push(`    <textColor>${toVueColor(it.textColor)}</textColor>`);
-      lines.push(`    <font>${xmlEscape(toVueFont(it.font))}</font>`);
-      lines.push(`    <nodeFilter/>`);
-      if (it.shape === "roundRect")
-        lines.push(`    <shape arcwidth="20.0" archeight="20.0" xsi:type="roundRect"/>`);
-      else lines.push(`    <shape xsi:type="${SHAPE_XML[it.shape]}"/>`);
-      lines.push(`  </child>`);
-    } else {
-      lines.push(
-        `  <child ID="${xmlEscape(it.id)}"${it.label ? ` label="${xmlEscape(it.label)}"` : ""}${layerRef} ` +
-          `x="${fx(Math.min(it.head.x, it.tail.x))}" y="${fx(Math.min(it.head.y, it.tail.y))}" ` +
-          `width="${fx(Math.abs(it.head.x - it.tail.x) || 1)}" height="${fx(Math.abs(it.head.y - it.tail.y) || 1)}" ` +
-          `strokeWidth="${fx(it.strokeWidth)}"${it.strokeStyle ? ` strokeStyle="${it.strokeStyle}"` : ""} ` +
-          `controlCount="${it.controlCount}" arrowState="${it.arrowState}"${hiddenAttr} xsi:type="link">`,
-      );
-      if (it.notes) lines.push(`    <notes>${xmlEscape(escapeVueNotes(it.notes))}</notes>`);
-      lines.push(...resourceXml(it.resource));
-      lines.push(`    <strokeColor>${toVueColor(it.stroke)}</strokeColor>`);
-      lines.push(`    <textColor>${toVueColor(it.textColor)}</textColor>`);
-      lines.push(`    <font>${xmlEscape(toVueFont(it.font))}</font>`);
-      lines.push(`    <nodeFilter/>`);
-      lines.push(`    <point1 x="${fx(it.head.x)}" y="${fx(it.head.y)}"/>`);
-      lines.push(`    <point2 x="${fx(it.tail.x)}" y="${fx(it.tail.y)}"/>`);
-      if (it.head.node != null) lines.push(`    <ID1>${xmlEscape(it.head.node)}</ID1>`);
-      if (it.tail.node != null) lines.push(`    <ID2>${xmlEscape(it.tail.node)}</ID2>`);
-      if (it.controlCount >= 1 && it.ctrl0)
-        lines.push(`    <ctrlPoint0 x="${fx(it.ctrl0.x)}" y="${fx(it.ctrl0.y)}"/>`);
-      if (it.controlCount === 2 && it.ctrl1)
-        lines.push(`    <ctrlPoint1 x="${fx(it.ctrl1.x)}" y="${fx(it.ctrl1.y)}"/>`);
-      if (it.headPruned) lines.push(`    <headUserPruned>true</headUserPruned>`);
-      if (it.tailPruned) lines.push(`    <tailUserPruned>true</tailUserPruned>`);
-      lines.push(`  </child>`);
+  // Children under LW-MAP in global paint order (grouped by layer), tagged with
+  // layerID at top level. Node containment is written as REAL nesting: child
+  // <child> elements inside their parent with parent-relative coordinates
+  // (modelVersion 5 semantics; no scale factor — grue has no child scaling).
+  // Inline node images are written back as xsi:type="image" children so legacy
+  // VUE can read them; label-less childless image nodes export as top-level
+  // image elements. Flat grue groups export as legacy group containers.
+  let imageIdCounter = doc.nextId;
+  const nextImageId = () => String(imageIdCounter++);
+
+  const kidsMap = new Map<string, GNode[]>();
+  for (const it of doc.items) {
+    if (it.kind !== "node" || it.parent == null) continue;
+    let arr = kidsMap.get(it.parent);
+    if (!arr) kidsMap.set(it.parent, (arr = []));
+    arr.push(it);
+  }
+
+  const writeImageEl = (
+    ind: string,
+    id: string,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+    resource: GResource | null,
+    hidden: boolean,
+    layerRef: string,
+  ) => {
+    lines.push(
+      `${ind}<child ID="${xmlEscape(id)}"${layerRef} x="${fx(x)}" y="${fx(y)}" ` +
+        `width="${fx(w)}" height="${fx(h)}" strokeWidth="0.0" autoSized="false"` +
+        `${hidden ? ` hidden="true"` : ""} xsi:type="image">`,
+    );
+    lines.push(...resourceXml(resource, ind + "  "));
+    lines.push(`${ind}  <strokeColor>#404040</strokeColor>`);
+    lines.push(`${ind}  <textColor>#000000</textColor>`);
+    lines.push(`${ind}  <font>SansSerif-plain-14</font>`);
+    lines.push(`${ind}  <nodeFilter/>`);
+    lines.push(`${ind}</child>`);
+  };
+
+  const writeNode = (it: GNode, ind: string, px: number, py: number, topLevel: boolean) => {
+    const layerRef = topLevel ? ` layerID="${xmlEscape(it.layer)}"` : "";
+    const kids = kidsMap.get(it.id) ?? [];
+    if (it.image && !it.label && kids.length === 0) {
+      // pure image node round-trips as a legacy image component
+      writeImageEl(ind, it.id, it.x - px, it.y - py, it.w, it.h, it.resource, it.hidden || it.image.hidden, layerRef);
+      return;
     }
+    const hiddenAttr = it.hidden ? ` hidden="true"` : "";
+    const columnAttr = kids.length ? ` isChildrenLayoutColumn="true"` : "";
+    lines.push(
+      `${ind}<child ID="${xmlEscape(it.id)}" label="${xmlEscape(it.label)}"${layerRef} ` +
+        `x="${fx(it.x - px)}" y="${fx(it.y - py)}" width="${fx(it.w)}" height="${fx(it.h)}" ` +
+        `strokeWidth="${fx(it.strokeWidth)}"${it.strokeStyle ? ` strokeStyle="${it.strokeStyle}"` : ""} ` +
+        `autoSized="${it.autoSized}"${columnAttr}${hiddenAttr} xsi:type="node">`,
+    );
+    if (it.notes) lines.push(`${ind}  <notes>${xmlEscape(escapeVueNotes(it.notes))}</notes>`);
+    lines.push(...resourceXml(it.resource, ind + "  "));
+    const fill = toVueColor(it.fill);
+    if (fill) lines.push(`${ind}  <fillColor>${fill}</fillColor>`);
+    lines.push(`${ind}  <strokeColor>${toVueColor(it.stroke)}</strokeColor>`);
+    lines.push(`${ind}  <textColor>${toVueColor(it.textColor)}</textColor>`);
+    lines.push(`${ind}  <font>${xmlEscape(toVueFont(it.font))}</font>`);
+    lines.push(`${ind}  <nodeFilter/>`);
+    for (const kid of kids) writeNode(kid, ind + "  ", it.x, it.y, false);
+    if (it.image) {
+      // display box position relative to the node, image display size verbatim
+      const box = imageBox({ ...it, image: { ...it.image, hidden: false } }, kids.length > 0)!;
+      const ix = box.x + Math.max(0, (box.w - it.image.w) / 2) - it.x;
+      const iy = box.y - it.y;
+      writeImageEl(ind + "  ", nextImageId(), ix, iy, it.image.w, it.image.h, it.resource, it.image.hidden, "");
+    }
+    if (it.shape === "roundRect")
+      lines.push(`${ind}  <shape arcwidth="20.0" archeight="20.0" xsi:type="roundRect"/>`);
+    else lines.push(`${ind}  <shape xsi:type="${SHAPE_XML[it.shape]}"/>`);
+    lines.push(`${ind}</child>`);
+  };
+
+  const writeLink = (it: GLink, ind: string, px: number, py: number, topLevel: boolean) => {
+    const layerRef = topLevel ? ` layerID="${xmlEscape(it.layer)}"` : "";
+    const hiddenAttr = it.hidden ? ` hidden="true"` : "";
+    lines.push(
+      `${ind}<child ID="${xmlEscape(it.id)}"${it.label ? ` label="${xmlEscape(it.label)}"` : ""}${layerRef} ` +
+        `x="${fx(Math.min(it.head.x, it.tail.x) - px)}" y="${fx(Math.min(it.head.y, it.tail.y) - py)}" ` +
+        `width="${fx(Math.abs(it.head.x - it.tail.x) || 1)}" height="${fx(Math.abs(it.head.y - it.tail.y) || 1)}" ` +
+        `strokeWidth="${fx(it.strokeWidth)}"${it.strokeStyle ? ` strokeStyle="${it.strokeStyle}"` : ""} ` +
+        `controlCount="${it.controlCount}" arrowState="${it.arrowState}"${hiddenAttr} xsi:type="link">`,
+    );
+    if (it.notes) lines.push(`${ind}  <notes>${xmlEscape(escapeVueNotes(it.notes))}</notes>`);
+    lines.push(...resourceXml(it.resource, ind + "  "));
+    lines.push(`${ind}  <strokeColor>${toVueColor(it.stroke)}</strokeColor>`);
+    lines.push(`${ind}  <textColor>${toVueColor(it.textColor)}</textColor>`);
+    lines.push(`${ind}  <font>${xmlEscape(toVueFont(it.font))}</font>`);
+    lines.push(`${ind}  <nodeFilter/>`);
+    lines.push(`${ind}  <point1 x="${fx(it.head.x - px)}" y="${fx(it.head.y - py)}"/>`);
+    lines.push(`${ind}  <point2 x="${fx(it.tail.x - px)}" y="${fx(it.tail.y - py)}"/>`);
+    if (it.head.node != null) lines.push(`${ind}  <ID1>${xmlEscape(it.head.node)}</ID1>`);
+    if (it.tail.node != null) lines.push(`${ind}  <ID2>${xmlEscape(it.tail.node)}</ID2>`);
+    if (it.controlCount >= 1 && it.ctrl0)
+      lines.push(`${ind}  <ctrlPoint0 x="${fx(it.ctrl0.x - px)}" y="${fx(it.ctrl0.y - py)}"/>`);
+    if (it.controlCount === 2 && it.ctrl1)
+      lines.push(`${ind}  <ctrlPoint1 x="${fx(it.ctrl1.x - px)}" y="${fx(it.ctrl1.y - py)}"/>`);
+    if (it.headPruned) lines.push(`${ind}  <headUserPruned>true</headUserPruned>`);
+    if (it.tailPruned) lines.push(`${ind}  <tailUserPruned>true</tailUserPruned>`);
+    lines.push(`${ind}</child>`);
+  };
+
+  // groups: written as legacy group containers holding their top-level members
+  const groupByMember = new Map<string, GGroup>();
+  for (const g of doc.groups) for (const m of g.members) groupByMember.set(m, g);
+  const writtenGroups = new Set<string>();
+
+  const writeGroup = (g: GGroup, layerId: string) => {
+    const members = doc.items.filter(
+      (i) => g.members.includes(i.id) && (i.kind === "link" || i.parent == null),
+    );
+    if (members.length < 2) {
+      // degenerate: write members individually
+      for (const m of members) {
+        if (m.kind === "node") writeNode(m, "  ", 0, 0, true);
+        else writeLink(m, "  ", 0, 0, true);
+      }
+      return;
+    }
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    const grow = (x: number, y: number) => {
+      minX = Math.min(minX, x); minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x); maxY = Math.max(maxY, y);
+    };
+    for (const m of members) {
+      if (m.kind === "node") { grow(m.x, m.y); grow(m.x + m.w, m.y + m.h); }
+      else { grow(m.head.x, m.head.y); grow(m.tail.x, m.tail.y); }
+    }
+    lines.push(
+      `  <child ID="${xmlEscape(g.id)}" layerID="${xmlEscape(layerId)}" x="${fx(minX)}" y="${fx(minY)}" ` +
+        `width="${fx(maxX - minX)}" height="${fx(maxY - minY)}" strokeWidth="0.0" autoSized="false" xsi:type="group">`,
+    );
+    for (const m of members) {
+      if (m.kind === "node") writeNode(m, "    ", minX, minY, false);
+      else writeLink(m, "    ", minX, minY, false);
+    }
+    lines.push(`  </child>`);
+  };
+
+  for (const it of paintOrder(doc)) {
+    if (it.kind === "node" && it.parent != null) continue; // written inside its parent
+    const g = groupByMember.get(it.id);
+    if (g) {
+      if (!writtenGroups.has(g.id)) {
+        writtenGroups.add(g.id);
+        writeGroup(g, it.layer);
+      }
+      continue;
+    }
+    if (it.kind === "node") writeNode(it, "  ", 0, 0, true);
+    else writeLink(it, "  ", 0, 0, true);
   }
 
   // empty layer shells, bottom-to-top (contents stay flat above, per legacy)
@@ -518,17 +752,17 @@ export function exportVue(doc: GDoc, mapLabel: string): string {
 }
 
 /** Legacy <resource> element: spec attribute plus optional <title> and <property> children. */
-function resourceXml(r: GResource | null): string[] {
+function resourceXml(r: GResource | null, ind = "    "): string[] {
   if (!r) return [];
   const open =
-    `    <resource referenceCreated="0" size="-1" spec="${xmlEscape(r.spec)}" ` +
+    `${ind}<resource referenceCreated="0" size="-1" spec="${xmlEscape(r.spec)}" ` +
     `type="0" xsi:type="map-resource"`;
   if (!r.title && r.properties.length === 0) return [open + "/>"];
   const lines = [open + ">"];
-  if (r.title) lines.push(`      <title>${xmlEscape(r.title)}</title>`);
+  if (r.title) lines.push(`${ind}  <title>${xmlEscape(r.title)}</title>`);
   for (const p of r.properties)
-    lines.push(`      <property key="${xmlEscape(p.key)}" value="${xmlEscape(p.value)}"/>`);
-  lines.push(`    </resource>`);
+    lines.push(`${ind}  <property key="${xmlEscape(p.key)}" value="${xmlEscape(p.value)}"/>`);
+  lines.push(`${ind}</resource>`);
   return lines;
 }
 
