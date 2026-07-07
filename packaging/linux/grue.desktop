@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Grue
+Comment=Visual knowledge-mapping application
+Exec=grue %F
+Icon=grue
+Terminal=false
+Categories=Office;Graphics;

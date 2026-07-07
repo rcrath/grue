@@ -1,0 +1,22 @@
+# PKGBUILD for the Grue Arch/Manjaro package.
+# Built by CI (.github/workflows/build.yml, arch-package job): the placeholder
+# pkgver below is replaced with the version from tauri.conf.json (hyphens
+# become underscores — pacman forbids hyphens in versions). The prebuilt
+# grue binary, grue.desktop, and grue.png are placed next to this file
+# before makepkg runs. Not intended for standalone use from a bare checkout.
+
+pkgname=grue
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="Visual knowledge-mapping application (VUE successor)"
+arch=('x86_64')
+url="https://github.com/rcrath/grue"
+license=('GPL-3.0-or-later')
+depends=('webkit2gtk-4.1' 'gtk3')
+options=('!strip' '!debug')
+
+package() {
+    install -Dm755 "$startdir/grue"         "$pkgdir/usr/bin/grue"
+    install -Dm644 "$startdir/grue.desktop" "$pkgdir/usr/share/applications/grue.desktop"
+    install -Dm644 "$startdir/grue.png"     "$pkgdir/usr/share/icons/hicolor/128x128/apps/grue.png"
+}
