@@ -6,3 +6,4 @@ src-tauri/gen/schemas/
 *.log
 
 CLAUDE.md
+ABOUT.md

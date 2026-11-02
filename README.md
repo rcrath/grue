@@ -56,4 +56,4 @@ server can host. If you serve it from a subfolder, change the asset paths in
 For development, `npm run tauri dev` runs the desktop app with live reload,
 and `npm run dev` runs the browser version on http://localhost:1420.
 
-Project background, design notes and CI details are in [ABOUT.md](ABOUT.md).
+CI builds every platform on a `v*` tag push and drafts a GitHub release.
