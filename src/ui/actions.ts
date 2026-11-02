@@ -7,7 +7,7 @@ import { AlignMode, Editor, Tool } from "./editor";
 import { lastCanvasContextPoint } from "./contextmenu";
 import { DocManager } from "./docs";
 import { promptText, openNotesEditor } from "./dialogs";
-import { pickFilePath } from "./platform";
+import { isTauri, pickFilePath } from "./platform";
 import { SHAPE_ORDER, SHAPE_LABELS, openSwatchPopup } from "./palette";
 import { PanelSet } from "./panels";
 import { openPreferences } from "./preferences";
@@ -19,7 +19,7 @@ export interface AppAction {
   label: string;
   shortcut?: string; // display only; bindings live in shortcuts.ts
   enabled: () => boolean;
-  run: () => void;
+  run: () => void | Promise<void>;
   checked?: () => boolean;
   tooltip?: string; // "coming soon" on wave 3/4 stubs
 }
@@ -29,6 +29,7 @@ export type ActionMap = Map<string, AppAction>;
 export interface FileOps {
   open(): void;
   openUrl(): void;
+  copyLinkAll(): void;
   save(): void;
   saveAs(): void;
   revert(): void;
@@ -64,6 +65,12 @@ export function buildActions(docs: DocManager, file: FileOps, panels: PanelSet):
   // ---------- File ----------
   add("file.open", { label: "Open…", shortcut: keyLabel("mod+o"), enabled: () => true, run: file.open });
   add("file.openUrl", { label: "Open from URL…", enabled: () => true, run: file.openUrl });
+  add("file.copyLinkAll", {
+    label: "Copy Link to All Open Maps",
+    enabled: () => !isTauri(),
+    run: file.copyLinkAll,
+    tooltip: "Web version: one link that reopens every open map (local files are kept in this browser)",
+  });
   add("file.save", { label: "Save", shortcut: keyLabel("mod+s"), enabled: () => true, run: file.save });
   add("file.saveAs", { label: "Save As…", shortcut: keyLabel("mod+shift+s"), enabled: () => true, run: file.saveAs });
   add("file.revert", { label: "Revert", enabled: file.canRevert, run: file.revert });
@@ -90,7 +97,7 @@ export function buildActions(docs: DocManager, file: FileOps, panels: PanelSet):
   add("edit.redo", { label: "Redo", shortcut: keyLabel("mod+shift+z"), enabled: () => ed().canRedo(), run: () => ed().redo() });
   add("edit.cut", { label: "Cut", shortcut: keyLabel("mod+x"), enabled: () => sel() > 0, run: () => ed().cutSelection() });
   add("edit.copy", { label: "Copy", shortcut: keyLabel("mod+c"), enabled: () => sel() > 0, run: () => ed().copySelection() });
-  add("edit.paste", { label: "Paste", shortcut: keyLabel("mod+v"), enabled: () => ed().canPaste(), run: () => ed().paste() });
+  add("edit.paste", { label: "Paste", shortcut: keyLabel("mod+v"), enabled: () => ed().canPaste(), run: () => void ed().paste() });
   add("edit.duplicate", { label: "Duplicate", shortcut: keyLabel("mod+d"), enabled: () => sel() > 0, run: () => ed().duplicateSelection() });
   add("edit.delete", { label: "Delete", shortcut: "Del", enabled: () => sel() > 0, run: () => ed().deleteSelection() });
   add("edit.rename", { label: "Rename", shortcut: "F2", enabled: () => sel() === 1, run: () => ed().renameSelection() });
@@ -123,6 +130,7 @@ export function buildActions(docs: DocManager, file: FileOps, panels: PanelSet):
   toolAction("tool.select", "Select Mode", "select", "S");
   toolAction("tool.link", "Link Mode", "link", "L");
   toolAction("tool.combo", "Rapid Mode", "combo", "R");
+  toolAction("tool.text", "Text Mode", "text", "T");
   // node at the right-click point (falls back to the cursor position when
   // invoked without a preceding canvas right-click)
   add("canvas.newNodeHere", {
@@ -133,6 +141,15 @@ export function buildActions(docs: DocManager, file: FileOps, panels: PanelSet):
       const p = lastCanvasContextPoint();
       if (p) ed().createNodeAt(p.x, p.y);
       else file.newNodeAtCursor();
+    },
+  });
+  // text box at the right-click point (same pattern as canvas.newNodeHere)
+  add("canvas.newTextHere", {
+    label: "Add a New Text",
+    enabled: () => true,
+    run: () => {
+      const p = lastCanvasContextPoint();
+      if (p) ed().createTextNodeAt(p.x, p.y);
     },
   });
 

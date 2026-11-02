@@ -136,6 +136,7 @@ export function installMenuBar(
       entries: () => [
         { id: "file.open" },
         { id: "file.openUrl" },
+        { id: "file.copyLinkAll" },
         sep,
         { id: "file.save" },
         { id: "file.saveAs" },

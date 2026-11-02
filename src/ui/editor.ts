@@ -6,8 +6,8 @@ import {
   LinkEnd, NodeShape, STROKE_DASHES, SELECTION_COLOR, attachChild, childrenOf,
   collapseHiddenIds, deleteItems, docBounds, expandToGroups, expandWithDescendants,
   getLayer, getNode, groupItems, hasStraightLinkBetween, imageBox, isImageResource,
-  isItemSelectable, isItemVisible, labelBlockHeight, layoutContainers, makeLink,
-  makeNode, newDoc, allocId, paintOrder, pruneHiddenIds, ungroupItems,
+  isItemSelectable, isItemVisible, isTextNode, labelBlockHeight, layoutContainers, makeLink,
+  makeNode, makeTextNode, newDoc, allocId, paintOrder, pruneHiddenIds, ungroupItems,
 } from "../core/model";
 import {
   Pt, distSqToSegment, flattenLinkPath, linkMidpoint, nodeCenter, nodeOutline,
@@ -18,9 +18,10 @@ import { autoSizeFor, fontToCss, measureLabel } from "./measure";
 import { isTauri } from "./platform";
 import { openNotesEditor } from "./dialogs";
 import { openAttachment } from "./help";
+import { handleChecklistSpec, isCheckSpec, syncChecklistLabels } from "./checklist";
 import { convertFileSrc } from "@tauri-apps/api/core";
 
-export type Tool = "select" | "node" | "link" | "hand" | "combo" | "zoom";
+export type Tool = "select" | "node" | "link" | "hand" | "combo" | "zoom" | "text";
 
 /** Style snapshot for Copy Style / Paste Style (ui-spec §5). Kind-matched on paste;
  *  held in memory only, never persisted. */
@@ -29,6 +30,28 @@ export type StyleSnapshot =
   | { kind: "link"; stroke: string; strokeWidth: number; strokeStyle: number; textColor: string; font: GFont; arrowState: number; controlCount: 0 | 1 | 2 };
 
 export type AlignMode = "top" | "bottom" | "left" | "right" | "rowCenter" | "colCenter";
+
+const CLIPBOARD_TAG = "grue-clipboard";
+
+interface GrueClipboardPayload {
+  tag: typeof CLIPBOARD_TAG;
+  version: 1;
+  items: GItem[];
+  groups: string[][];
+}
+
+/** Recognize grue's own JSON on the OS clipboard vs. plain external text. */
+function parseGrueClipboard(text: string): { items: GItem[]; groups: string[][] } | null {
+  let obj: unknown;
+  try {
+    obj = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  const p = obj as Partial<GrueClipboardPayload> | null;
+  if (!p || typeof p !== "object" || p.tag !== CLIPBOARD_TAG || !Array.isArray(p.items)) return null;
+  return { items: p.items, groups: Array.isArray(p.groups) ? p.groups : [] };
+}
 
 /** Style patch applied to every selected item of the matching kind. */
 export interface StylePatch {
@@ -48,6 +71,8 @@ const ZOOM_PRESETS = [
 const FIT_PAD = 20;
 const DRAG_START_PX = 3;
 const CREATE_MIN_PX = 10;
+const DBLCLICK_MS = 350;
+const DBLCLICK_PX = 5;
 
 type Drag =
   | { kind: "none" }
@@ -82,10 +107,15 @@ export class Editor {
 
   private history = new History();
   private drag: Drag = { kind: "none" };
+  private downS: Pt = { x: 0, y: 0 }; // screen point of the current pointerdown
+  private lastTap = { t: 0, x: 0, y: 0 }; // for manual double-click detection
   private holdKey: string | null = null; // hold-down temporary tool key
   private holdTool: Tool | null = null;
   private editingId: string | null = null;
   private labelBox: HTMLTextAreaElement | null = null;
+  // set only while editing a text box just created via the text tool — an
+  // empty commit deletes it instead of leaving an invisible empty item
+  private newTextBoxId: string | null = null;
   private clipboard: { items: GItem[]; groups: string[][] } | null = null;
   private pasteBump = 0;
   private styleBuffer: StyleSnapshot | null = null;
@@ -125,7 +155,6 @@ export class Editor {
     this.svg.addEventListener("pointerdown", (e) => this.pointerDown(e));
     this.svg.addEventListener("pointermove", (e) => this.pointerMove(e));
     this.svg.addEventListener("pointerup", (e) => this.pointerUp(e));
-    this.svg.addEventListener("dblclick", (e) => this.doubleClick(e));
     this.svg.addEventListener("wheel", (e) => this.wheel(e), { passive: false });
     this.svg.addEventListener("contextmenu", (e) => e.preventDefault());
     window.addEventListener("keydown", this.winKeyDown);
@@ -232,7 +261,7 @@ export class Editor {
     const t = this.effectiveTool();
     this.svg.style.cursor =
       t === "hand" ? (this.drag.kind === "pan" ? "grabbing" : "grab")
-      : t === "node" || t === "link" || t === "combo" ? "crosshair"
+      : t === "node" || t === "link" || t === "combo" || t === "text" ? "crosshair"
       : t === "zoom" ? "zoom-in"
       : "default";
   }
@@ -691,7 +720,7 @@ export class Editor {
     return this.expandStack.length > 0;
   }
 
-  // ---------- clipboard (in-memory, app-local) ----------
+  // ---------- clipboard (OS clipboard as grue-tagged JSON, in-memory as fallback) ----------
 
   copySelection(): void {
     // children travel with their parent (containment)
@@ -703,6 +732,12 @@ export class Editor {
       .map((g) => [...g.members]);
     this.clipboard = { items, groups };
     this.pasteBump = 0;
+    const payload: GrueClipboardPayload = { tag: CLIPBOARD_TAG, version: 1, items, groups };
+    try {
+      void navigator.clipboard?.writeText(JSON.stringify(payload)).catch(() => {});
+    } catch {
+      // no OS clipboard access (e.g. npm run dev without permission) — in-memory buffer still works
+    }
   }
 
   cutSelection(): void {
@@ -712,18 +747,40 @@ export class Editor {
   }
 
   canPaste(): boolean {
-    return this.clipboard != null && this.clipboard.items.length > 0;
+    // OS clipboard content isn't knowable synchronously; paste() no-ops if there's nothing usable
+    return true;
   }
 
-  paste(): void {
-    if (!this.clipboard) return;
-    const src = this.clipboard;
+  async paste(): Promise<void> {
+    let text: string | null = null;
+    try {
+      text = (await navigator.clipboard?.readText()) ?? null;
+    } catch {
+      text = null;
+    }
+    if (text) {
+      const tagged = parseGrueClipboard(text);
+      if (tagged) {
+        this.pasteItems(tagged.items, tagged.groups);
+        return;
+      }
+      if (text.trim()) {
+        const v = this.viewportWorld();
+        this.createNodeAt(v.x + v.w / 2, v.y + v.h / 2, false, text.trim());
+        return;
+      }
+    }
+    if (this.clipboard) this.pasteItems(this.clipboard.items, this.clipboard.groups);
+  }
+
+  private pasteItems(items: GItem[], groups: string[][]): void {
+    if (!items.length) return;
     const off = 10 * ++this.pasteBump;
     const layerIds = new Set(this.doc.layers.map((l) => l.id));
     this.mutate(() => {
       const idMap = new Map<string, string>();
       const clones: GItem[] = [];
-      for (const it of src.items) {
+      for (const it of items) {
         const clone = structuredClone(it);
         idMap.set(clone.id, (clone.id = allocId(this.doc)));
         if (!layerIds.has(clone.layer)) clone.layer = this.doc.activeLayer;
@@ -747,7 +804,7 @@ export class Editor {
         }
       }
       this.doc.items.push(...clones);
-      for (const members of src.groups) {
+      for (const members of groups) {
         const mapped = members.map((m) => idMap.get(m)).filter((m): m is string => m != null);
         groupItems(this.doc, mapped);
       }
@@ -1238,15 +1295,30 @@ export class Editor {
     }
   }
 
-  createNodeAt(wx: number, wy: number, openEditor = true): GNode {
+  createNodeAt(wx: number, wy: number, openEditor = true, label?: string): GNode {
     let created: GNode;
     this.mutate(() => {
-      const size = autoSizeFor("New Node", { family: "Arial", size: 12, bold: false, italic: false, underline: false });
+      const text = label ?? "New Node";
+      const size = autoSizeFor(text, { family: "Arial", size: 12, bold: false, italic: false, underline: false });
       created = makeNode(this.doc, wx - size.w / 2, wy - size.h / 2, size.w, size.h, this.defaultShape);
+      created.label = text;
       this.doc.items.push(created);
       this.selection = new Set([created.id]);
     });
     if (openEditor) this.startLabelEdit(created!.id, true);
+    return created!;
+  }
+
+  createTextNodeAt(wx: number, wy: number): GNode {
+    let created: GNode;
+    this.mutate(() => {
+      const font = { family: "Arial", size: 12, bold: false, italic: false, underline: false };
+      const size = autoSizeFor("", font);
+      created = makeTextNode(this.doc, wx - size.w / 2, wy - size.h / 2, size.w, size.h);
+      this.doc.items.push(created);
+      this.selection = new Set([created.id]);
+    });
+    this.startLabelEdit(created!.id, true);
     return created!;
   }
 
@@ -1388,7 +1460,7 @@ export class Editor {
     }
     const w = this.screenToWorld(e.clientX, e.clientY);
     const s = { x: e.clientX, y: e.clientY };
-
+    this.downS = s;
 
     if (e.button === 1 || this.effectiveTool() === "hand") {
       this.drag = { kind: "pan", startS: s, origPan: { x: this.panX, y: this.panY } };
@@ -1446,6 +1518,11 @@ export class Editor {
 
     if (tool === "zoom") {
       this.drag = { kind: "zoomRect", startW: w, curW: w, started: false, out: e.shiftKey, startS: s };
+      return;
+    }
+
+    if (tool === "text") {
+      // creation is double-click only, same as link/combo on blank canvas
       return;
     }
   }
@@ -1585,6 +1662,27 @@ export class Editor {
     this.drag = { kind: "none" };
     this.updateCursor();
 
+    // Manual double-click detection: every render rebuilds the item DOM between
+    // the two clicks, so the browser never fires a native dblclick on canvas
+    // items — we time the taps ourselves instead.
+    const tap =
+      e.button === 0 &&
+      Math.abs(e.clientX - this.downS.x) <= DRAG_START_PX &&
+      Math.abs(e.clientY - this.downS.y) <= DRAG_START_PX;
+    if (tap) {
+      const now = e.timeStamp || performance.now();
+      if (
+        now - this.lastTap.t <= DBLCLICK_MS &&
+        Math.abs(e.clientX - this.lastTap.x) <= DBLCLICK_PX &&
+        Math.abs(e.clientY - this.lastTap.y) <= DBLCLICK_PX
+      ) {
+        this.lastTap = { t: 0, x: 0, y: 0 };
+        this.doubleClick(e);
+        return;
+      }
+      this.lastTap = { t: now, x: e.clientX, y: e.clientY };
+    }
+
     switch (d.kind) {
       case "maybeMove": {
         // plain click on an already-selected item: re-select just it (its whole group)
@@ -1722,6 +1820,10 @@ export class Editor {
       }
       return;
     }
+    if (tool === "text") {
+      this.createTextNodeAt(w.x, w.y);
+      return;
+    }
     // double-click on empty canvas creates a node in select/node/link/rapid
     // modes (single click never creates — it escapes label edits instead)
     if (tool === "select" || tool === "node" || tool === "link" || tool === "combo") {
@@ -1820,6 +1922,9 @@ export class Editor {
       case "r":
         this.setTool("combo");
         return;
+      case "t":
+        this.setTool("text");
+        return;
       case "x":
       case "X":
         this.setHoldTool("x", "node");
@@ -1866,6 +1971,7 @@ export class Editor {
     const it = this.doc.items.find((i) => i.id === id);
     if (!it) return;
     this.editingId = id;
+    this.newTextBoxId = isNew && isTextNode(it) ? id : null;
 
     const box = document.createElement("textarea");
     box.className = "label-edit";
@@ -1937,12 +2043,18 @@ export class Editor {
     if (!this.labelBox || this.editingId == null) return;
     const box = this.labelBox;
     const id = this.editingId;
+    const isNewTextBox = this.newTextBoxId === id;
     this.labelBox = null;
     this.editingId = null;
+    this.newTextBoxId = null;
     const value = box.value;
     box.remove();
     const it = this.doc.items.find((i) => i.id === id);
     if (!it) return;
+    if (isNewTextBox && value.trim() === "") {
+      this.mutate(() => deleteItems(this.doc, new Set([id])));
+      return;
+    }
     if (it.label === value) {
       this.render();
       return;
@@ -1961,9 +2073,16 @@ export class Editor {
 
   private abortLabelEdit(): void {
     if (!this.labelBox) return;
+    const id = this.editingId;
+    const isNewTextBox = this.newTextBoxId === id;
     this.labelBox.remove();
     this.labelBox = null;
     this.editingId = null;
+    this.newTextBoxId = null;
+    if (isNewTextBox && id != null) {
+      this.mutate(() => deleteItems(this.doc, new Set([id])));
+      return;
+    }
     this.render();
   }
 
@@ -2084,7 +2203,8 @@ export class Editor {
   // ---------- rendering ----------
 
   render(): void {
-    this.pruneSet = this.showPruning ? pruneHiddenIds(this.doc) : EMPTY_SET;
+    syncChecklistLabels(this.doc);
+    this.pruneSet =this.showPruning ? pruneHiddenIds(this.doc) : EMPTY_SET;
     this.collapseSet = collapseHiddenIds(this.doc);
     this.svg.style.background = this.doc.background;
     this.world.setAttribute("transform", `translate(${this.panX},${this.panY}) scale(${this.zoom})`);
@@ -2153,7 +2273,14 @@ export class Editor {
     // small corner glyphs: attachment (top-right), notes (bottom-right) —
     // offset a bit further in from the corner than the old r=3 glyph needed,
     // so the larger r=6 badge doesn't poke outside the node's edge
-    if (n.resource) g.appendChild(badge(n.x + n.w - 8, n.y + 8, "resource", n.resource.spec, () => this.activateBadge(n.id, "resource")));
+    if (n.resource && isCheckSpec(n.resource.spec)) {
+      // check box node: the whole node is the click target instead of a corner dot
+      g.appendChild(wholeNodeButton(n.x, n.y, n.w, n.h, () => this.activateBadge(n.id, "resource")));
+    } else if (n.resource) {
+      // link icon is as tall as one line of the node's text (never smaller than the old dot)
+      const iconH = Math.max(15, Math.round(n.font.size * 1.25));
+      g.appendChild(badge(n.x + n.w - iconH / 2 - 1, n.y + iconH / 2 + 1, "resource", n.resource.spec, () => this.activateBadge(n.id, "resource"), iconH));
+    }
     if (n.notes) g.appendChild(badge(n.x + n.w - 8, n.y + n.h - 8, "note", n.notes, () => this.activateBadge(n.id, "note")));
     this.itemsG.appendChild(g);
   }
@@ -2239,7 +2366,7 @@ export class Editor {
     this.selection = new Set([itemId]);
     this.render();
     if (kind === "resource") {
-      if (it.resource) openAttachment(it.resource.spec);
+      if (it.resource && !handleChecklistSpec(it.resource.spec, () => this.render())) openAttachment(it.resource.spec);
     } else {
       const name = it.label.trim() || (it.kind === "node" ? "node" : "link");
       openNotesEditor({
@@ -2465,18 +2592,52 @@ function el(name: string): SVGElement {
  *  its own pointerdown handler that stops propagation before the editor's
  *  central pointerDown ever sees the event, so a badge click can never start
  *  a drag or marquee. */
-function badge(cx: number, cy: number, kind: "resource" | "note", tip: string, onActivate: () => void): SVGElement {
+/** Invisible rectangle covering a whole node; a click on it activates the node's
+ *  attachment (used by the maps-page check boxes). Like badge(), it stops the
+ *  pointerdown so the click never starts a drag or marquee. */
+function wholeNodeButton(x: number, y: number, w: number, h: number, onActivate: () => void): SVGElement {
+  const r = el("rect");
+  r.setAttribute("x", String(x));
+  r.setAttribute("y", String(y));
+  r.setAttribute("width", String(w));
+  r.setAttribute("height", String(h));
+  r.setAttribute("rx", "8");
+  r.setAttribute("fill", "transparent");
+  r.setAttribute("pointer-events", "all");
+  r.style.cursor = "pointer";
+  r.addEventListener("pointerdown", (e) => {
+    e.stopPropagation();
+    onActivate();
+  });
+  const title = el("title");
+  title.textContent = "Click to add to or remove from the list";
+  r.appendChild(title);
+  return r;
+}
+
+function badge(cx: number, cy: number, kind: "resource" | "note", tip: string, onActivate: () => void, size = 15): SVGElement {
   const g = el("g");
   g.style.cursor = "pointer";
   if (kind === "resource") {
-    const c = el("circle");
-    c.setAttribute("cx", String(cx));
-    c.setAttribute("cy", String(cy));
-    c.setAttribute("r", "6");
-    c.setAttribute("fill", "#4A95FF");
-    c.setAttribute("stroke", "#ffffff");
-    c.setAttribute("stroke-width", "1");
-    g.appendChild(c);
+    // chain-link icon: two interlocking pills on a diagonal, blue with a white halo
+    // so it stays readable on any node color
+    const icon = el("g");
+    icon.setAttribute("transform", `translate(${cx},${cy}) rotate(-45) scale(${size / 15})`);
+    for (const [stroke, width] of [["#ffffff", "4.4"], ["#4A95FF", "2.2"]] as const) {
+      for (const x of [-7.5, -1.5]) {
+        const pill = el("rect");
+        pill.setAttribute("x", String(x));
+        pill.setAttribute("y", "-3");
+        pill.setAttribute("width", "9");
+        pill.setAttribute("height", "6");
+        pill.setAttribute("rx", "3");
+        pill.setAttribute("fill", "none");
+        pill.setAttribute("stroke", stroke);
+        pill.setAttribute("stroke-width", width);
+        icon.appendChild(pill);
+      }
+    }
+    g.appendChild(icon);
   } else {
     const t = el("path");
     t.setAttribute("d", `M${cx - 6},${cy + 6} L${cx + 6},${cy + 6} L${cx + 6},${cy - 6} Z`);
@@ -2488,7 +2649,7 @@ function badge(cx: number, cy: number, kind: "resource" | "note", tip: string, o
   const hit = el("circle");
   hit.setAttribute("cx", String(cx));
   hit.setAttribute("cy", String(cy));
-  hit.setAttribute("r", "9");
+  hit.setAttribute("r", String(Math.max(9, size / 2 + 1)));
   hit.setAttribute("fill", "transparent");
   hit.setAttribute("pointer-events", "all");
   hit.addEventListener("pointerdown", (e) => {

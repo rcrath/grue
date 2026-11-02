@@ -11,12 +11,26 @@ import { confirmSaveClose } from "./dialogs";
 import { baseName, isTauri, readFile, saveFileAs, saveFileTo } from "./platform";
 import { getPref } from "./prefs";
 import { PREF_DEFAULT_SHAPE } from "./preferences";
+import { newStoreKey, putStored } from "./storedmaps";
 
 interface OpenDoc {
   editor: Editor;
   path: string | null; // null = never saved (or browser fallback)
   name: string;
   container: HTMLElement;
+  /** Web address this map was loaded from (Open from URL / ?map= links), if any. */
+  sourceUrl: string | null;
+  /** Key of this map's copy in browser storage (combined links), if it has one. */
+  storeKey: string | null;
+  /** Loaded from a file/URL and not changed since: flagged dirty only so Save As
+   *  is forced, but nothing would be lost by leaving, so no warning/prompt. */
+  untouched: boolean;
+}
+
+/** Where a map came from, passed to openContent. */
+export interface DocOrigin {
+  sourceUrl?: string;
+  storeKey?: string;
 }
 
 export interface DocInfo {
@@ -51,12 +65,14 @@ export class DocManager {
   count(): number { return this.docs.length; }
   editors(): Editor[] { return this.docs.map((d) => d.editor); }
   anyDirty(): boolean { return this.docs.some((d) => d.editor.dirty); }
+  /** Real edits only: untouched file/URL loads don't count (nothing to lose). */
+  anyEdited(): boolean { return this.docs.some((d) => isEdited(d)); }
 
   list(): DocInfo[] {
     return this.docs.map((d, i) => ({
       name: d.name,
       path: d.path,
-      dirty: d.editor.dirty,
+      dirty: isEdited(d),
       active: i === this.activeIdx,
     }));
   }
@@ -87,7 +103,7 @@ export class DocManager {
 
       const name = document.createElement("span");
       name.className = "tab-name";
-      name.textContent = d.name + (d.editor.dirty ? " •" : "");
+      name.textContent = d.name + (isEdited(d) ? " •" : "");
 
       const close = document.createElement("button");
       close.className = "tab-close";
@@ -121,8 +137,9 @@ export class DocManager {
     this.canvasHost.appendChild(container);
     const editor = new Editor(container);
     editor.defaultShape = getPref<NodeShape>(PREF_DEFAULT_SHAPE, "roundRect");
-    const d: OpenDoc = { editor, path: null, name, container };
+    const d: OpenDoc = { editor, path: null, name, container, sourceUrl: null, storeKey: null, untouched: false };
     editor.onChange = () => {
+      d.untouched = false; // any change after loading is a real edit (or a save)
       this.renderTabs(); // dirty dots
       this.onChanged();
     };
@@ -156,7 +173,7 @@ export class DocManager {
   /** Load .grue/.vue text into a NEW tab (shared by Open, recents, Open from
    *  URL, drag & drop). Reuses the current tab when it's a pristine untitled.
    *  Throws on parse errors (before any tab is created). */
-  openContent(name: string, text: string, path: string | null, forceUnsaved = false): void {
+  openContent(name: string, text: string, path: string | null, forceUnsaved = false, origin: DocOrigin = {}): void {
     const isVue = name.toLowerCase().endsWith(".vue");
     let doc: GDoc;
     if (isVue) {
@@ -175,14 +192,46 @@ export class DocManager {
     this.activate(this.docs.indexOf(target)); // before setDoc so zoomFit sees real bounds
     target.editor.setDoc(doc);
     if (isVue) target.editor.zoomFit();
+    target.sourceUrl = origin.sourceUrl ?? null;
+    target.storeKey = origin.storeKey ?? null;
     if (isVue || forceUnsaved) {
       target.editor.dirty = true;
+      target.untouched = true; // forced Save As only; cleared by the first real change
       this.renderTabs();
       this.onChanged();
+    } else {
+      target.untouched = false;
     }
     // image paths from other machines (e.g. /home/... on Windows) resolve against
     // the map file's own folder via the legacy @file.relative property
     void this.resolveImagePaths(target, dirName(path));
+  }
+
+  // ---------- combined link (web version) ----------
+
+  /** One link that reopens every open map. Maps with a web address go in as
+   *  ?map=…; the rest (local files, new maps) are copied into this browser's
+   *  storage and go in as ?stored=<key>. The link takes a snapshot: edits made
+   *  afterwards don't update it, until the map is saved (see syncStored). */
+  async buildCombinedLink(): Promise<{ url: string; byAddress: number; stored: number }> {
+    const parts: string[] = [];
+    let byAddress = 0;
+    let stored = 0;
+    const pageDir = location.origin + location.pathname.replace(/[^/]*$/, "");
+    for (const d of this.docs) {
+      if (this.isPristineUntitled(d)) continue;
+      if (d.sourceUrl) {
+        const rel = d.sourceUrl.startsWith(pageDir) ? d.sourceUrl.slice(pageDir.length) : d.sourceUrl;
+        parts.push("map=" + encodeURIComponent(rel).replace(/%2F/g, "/"));
+        byAddress++;
+      } else {
+        const key = (d.storeKey ??= newStoreKey());
+        await putStored(key, d.name, docToJson(d.editor.doc));
+        parts.push("stored=" + key);
+        stored++;
+      }
+    }
+    return { url: location.origin + location.pathname + (parts.length ? "?" + parts.join("&") : ""), byAddress, stored };
   }
 
   // ---------- save / revert ----------
@@ -193,7 +242,19 @@ export class DocManager {
     await saveFileTo(d.path, docToJson(d.editor.doc));
     this.addRecent(d.path);
     d.editor.markSaved(); // onChange → tab dots + chrome
+    await this.syncStored(d);
     return true;
+  }
+
+  /** A save replaces the browser-stored copy (if this map has one) so links made
+   *  earlier open the saved version. */
+  private async syncStored(d: OpenDoc): Promise<void> {
+    if (!d.storeKey) return;
+    try {
+      await putStored(d.storeKey, d.name, docToJson(d.editor.doc));
+    } catch {
+      // storage unavailable: the link keeps the older copy
+    }
   }
 
   private async saveDocAs(d: OpenDoc): Promise<boolean> {
@@ -206,6 +267,7 @@ export class DocManager {
       this.addRecent(path);
     }
     d.editor.markSaved();
+    await this.syncStored(d);
     return true;
   }
 
@@ -251,7 +313,7 @@ export class DocManager {
     try {
       const d = this.docs[i];
       if (!d) return true;
-      if (d.editor.dirty) {
+      if (isEdited(d)) {
         this.activate(this.docs.indexOf(d)); // show the doc being asked about
         const choice = await confirmSaveClose(d.name);
         if (choice === "cancel") return false;
@@ -284,7 +346,7 @@ export class DocManager {
   async confirmQuitAll(): Promise<boolean> {
     for (const d of [...this.docs]) {
       if (this.docs.indexOf(d) < 0) continue;
-      if (d.editor.dirty) {
+      if (isEdited(d)) {
         this.activate(this.docs.indexOf(d)); // show the doc being asked about
         const choice = await confirmSaveClose(d.name);
         if (choice === "cancel") return false;
@@ -356,6 +418,10 @@ export class DocManager {
       this.onChanged();
     }
   }
+}
+
+function isEdited(d: OpenDoc): boolean {
+  return d.editor.dirty && !d.untouched;
 }
 
 function dirName(p: string | null): string | null {

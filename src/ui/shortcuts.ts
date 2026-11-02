@@ -19,6 +19,7 @@ export const BINDINGS: Record<string, string> = {
   "mod+p": "file.print",
   "mod+w": "file.close",
   "mod+n": "edit.newNodeAtCursor", // reality: legacy Ctrl+N = new node at cursor (kept from wave 1)
+  "mod+t": "tool.text", // legacy's actual chord for the text tool (issue #14)
   "mod+alt+n": "file.new", // New Map (issue #4: Ctrl+Shift+N is grabbed by the clipboard manager)
   "mod+z": "edit.undo",
   "mod+shift+z": "edit.redo",

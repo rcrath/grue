@@ -67,7 +67,7 @@ export function confirmSaveClose(name: string): Promise<"save" | "discard" | "ca
         <button class="dlg-cancel">Cancel</button>
         <button class="dlg-ok">Save</button>
       </div>`;
-    dlg.querySelector(".dlg-text")!.textContent = `Save changes to “${name}” before closing?`;
+    dlg.querySelector(".dlg-text")!.textContent = `“${name}” has edits that will be lost if you close without saving. Save a copy to your computer first?`;
     overlay.appendChild(dlg);
     document.body.appendChild(overlay);
 

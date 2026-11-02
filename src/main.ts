@@ -10,6 +10,8 @@ import { installMenuBar } from "./ui/menubar";
 import { installContextMenu } from "./ui/contextmenu";
 import { installShortcuts } from "./ui/shortcuts";
 import { promptText } from "./ui/dialogs";
+import { toast } from "./ui/help";
+import { getStored } from "./ui/storedmaps";
 import { createPanels } from "./ui/panels";
 import { getPref, setPref } from "./ui/prefs";
 import { PREF_AUTOSAVE, PREF_PANNER_ON_START } from "./ui/preferences";
@@ -74,6 +76,7 @@ const toolDefs: [Tool, string, string][] = [
   ["node", "node", "Node tool (n): double-click or drag to create"],
   ["link", "link", "Link tool (l): drag from node to node"],
   ["combo", "rapid", "Rapid-link tool (r): link to empty space to create the node, hold Alt for one-shot"],
+  ["text", "text", "Text tool (t): double-click to create a text box"],
   ["hand", "pan", "Pan tool (m), or hold Space"],
 ];
 for (const [t, label, title] of toolDefs) {
@@ -222,21 +225,72 @@ async function openRecent(index: number): Promise<void> {
 async function doOpenUrl(): Promise<void> {
   const url = await promptText({ title: "Open from URL", label: "URL", placeholder: "https://example.com/map.grue" });
   if (!url || !url.trim()) return;
-  const spec = url.trim();
+  await openFromUrl(url.trim());
+}
+
+async function openFromUrl(spec: string): Promise<void> {
   try {
-    const res = await fetch(spec);
+    const res = await fetch(spec, { cache: "no-cache" }); // always revalidate: index maps change when files do
     if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
     const text = await res.text();
     let name = "untitled.grue";
+    let sourceUrl: string | undefined;
     try {
-      name = baseName(decodeURIComponent(new URL(spec).pathname)) || name;
+      const u = new URL(spec, location.href);
+      sourceUrl = u.href;
+      name = baseName(decodeURIComponent(u.pathname)) || name;
     } catch {
       // unparseable URL path: keep the fallback name
     }
     // came from the network — no path, force Save As
-    docs.openContent(name, text, null, true);
+    docs.openContent(name, text, null, true, { sourceUrl });
   } catch (err) {
     alert(`Could not open ${spec}:\n${err instanceof Error ? err.message : err}`);
+  }
+}
+
+// Open a map kept in this browser's storage (made by "Copy Link to All Open Maps").
+async function openStored(key: string): Promise<void> {
+  try {
+    const found = await getStored(key);
+    if (!found) {
+      alert(`The saved map "${key}" is not in this browser's storage.\nStored maps only open in the browser that made the link.`);
+      return;
+    }
+    docs.openContent(found.name, found.text, null, true, { storeKey: key });
+  } catch (err) {
+    alert(`Could not open the saved map "${key}":\n${err instanceof Error ? err.message : err}`);
+  }
+}
+
+// web version: ?map=<url> and ?stored=<key> (repeat for several, in tab order) open
+// those maps at startup. Relative URLs resolve against the page, e.g. ?map=maps/BizPlan.grue
+if (!isTauri()) {
+  void (async () => {
+    for (const [k, v] of new URLSearchParams(location.search)) {
+      if (!v.trim()) continue;
+      if (k === "map") await openFromUrl(v.trim());
+      else if (k === "stored") await openStored(v.trim());
+    }
+  })();
+}
+
+// File > Copy Link to All Open Maps (web version)
+async function doCopyLinkAll(): Promise<void> {
+  try {
+    const { url, byAddress, stored } = await docs.buildCombinedLink();
+    if (byAddress + stored === 0) {
+      toast("No open maps to link");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(url);
+      toast(`Link copied: ${byAddress + stored} map${byAddress + stored === 1 ? "" : "s"}${stored ? ` (${stored} kept in this browser)` : ""}`);
+    } catch {
+      window.prompt("Copy this link:", url); // clipboard blocked: let the user copy it by hand
+    }
+  } catch (err) {
+    alert(`Could not make the link:\n${err instanceof Error ? err.message : err}`);
   }
 }
 
@@ -282,6 +336,7 @@ const actions = buildActions(
   {
     open: () => void doOpen(),
     openUrl: () => void doOpenUrl(),
+    copyLinkAll: () => void doCopyLinkAll(),
     save: () => void docs.saveActive(),
     saveAs: () => void docs.saveActiveAs(),
     revert: () => void docs.revertActive(),
@@ -341,7 +396,9 @@ window.addEventListener("drop", async (e) => {
 
 // browser dev fallback only — the Tauri close button goes through onCloseRequested
 window.addEventListener("beforeunload", (e) => {
-  if (!isTauri() && docs.anyDirty()) e.preventDefault();
+  // browsers only allow their own generic "changes may not be saved" prompt here;
+  // the Save-a-copy offer comes from closing the tab inside grue
+  if (!isTauri() && docs.anyEdited()) e.preventDefault();
 });
 
 // debug/automation hook (also used by smoke tests)

@@ -46,6 +46,7 @@ function canvasMenu(): MenuEntry[] {
     // tool/mode block (issue #9): quick mode switching + node creation at the click point
     { id: "tool.select" },
     { id: "canvas.newNodeHere" },
+    { id: "canvas.newTextHere" },
     { id: "tool.link" },
     { id: "tool.combo" },
     sep,

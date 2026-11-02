@@ -20,7 +20,7 @@ export function openExternal(url: string): void {
 }
 
 /** Brief bottom-of-screen message, e.g. for actions that need the desktop app. */
-function toast(message: string): void {
+export function toast(message: string): void {
   document.querySelector(".toast")?.remove();
   const t = document.createElement("div");
   t.className = "toast";

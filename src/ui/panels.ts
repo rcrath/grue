@@ -101,6 +101,38 @@ export class LayersPanel extends FloatingPanel {
     this.editor.mutate(() => reorderLayer(doc, doc.activeLayer, to));
   }
 
+  /** Eye-button click (2026-07-20 spec): plain click solos the layer (hides every
+   *  other layer, shows this one) and moves focus here. Ctrl-click toggles just
+   *  this layer's visibility, additive/subtractive, without touching focus. Shift-
+   *  click makes the inclusive range between the current focus layer and this one
+   *  visible, also without touching focus. Focus only ever moves on a plain click. */
+  private onEyeClick(layerId: string, e: MouseEvent): void {
+    const doc = this.editor.doc;
+
+    if (e.ctrlKey || e.metaKey) {
+      const l = getLayer(doc, layerId);
+      if (l) this.editor.mutate(() => (l.hidden = !l.hidden));
+      return;
+    }
+
+    if (e.shiftKey) {
+      const order = doc.layers.map((l) => l.id);
+      const a = order.indexOf(doc.activeLayer);
+      const b = order.indexOf(layerId);
+      const [lo, hi] = a >= 0 && b >= 0 ? (a < b ? [a, b] : [b, a]) : [b, b];
+      const range = new Set(order.slice(lo, hi + 1));
+      this.editor.mutate(() => {
+        for (const l of doc.layers) if (range.has(l.id)) l.hidden = false;
+      });
+      return;
+    }
+
+    this.editor.mutate(() => {
+      for (const l of doc.layers) l.hidden = l.id !== layerId;
+    });
+    this.editor.activateLayer(layerId);
+  }
+
   refresh(): void {
     if (!this.isOpen() || this.renamingId != null) return;
     const doc = this.editor.doc;
@@ -113,12 +145,11 @@ export class LayersPanel extends FloatingPanel {
     for (const layer of [...doc.layers].reverse()) {
       const row = div("layer-row" + (layer.id === doc.activeLayer ? " active" : ""));
 
-      // look the layer up by id at click time — undo/redo replaces the doc,
-      // so objects captured at build time can go stale
-      const eye = btn("👁", layer.hidden ? "Show layer" : "Hide layer", () => {
-        const l = getLayer(this.editor.doc, layer.id);
-        if (l) this.editor.mutate(() => (l.hidden = !l.hidden));
-      });
+      const eye = document.createElement("button");
+      eye.className = "panel-btn";
+      eye.textContent = "👁";
+      eye.title = layer.hidden ? "Show layer" : "Hide layer";
+      eye.addEventListener("click", (e) => this.onEyeClick(layer.id, e as MouseEvent));
       eye.classList.toggle("off", layer.hidden);
 
       const lock = btn("🔒", layer.locked ? "Unlock layer" : "Lock layer (contents not selectable)", () => {
@@ -348,6 +379,7 @@ export class InfoPanel extends FloatingPanel {
 export class OutlinePanel extends FloatingPanel {
   private list: HTMLElement;
   private sig = "";
+  private lastTap = { id: "", t: 0 }; // manual double-click (rows are rebuilt on refresh)
 
   constructor(private getEditor: () => Editor) {
     super({ key: "outline", title: "Outline", className: "panel-md", closeHint: "Close (Ctrl+7)", defaultPos: { top: 96, left: 260 } });
@@ -386,12 +418,18 @@ export class OutlinePanel extends FloatingPanel {
             : `${endName(this.editor, it.head)} → ${endName(this.editor, it.tail)}`;
         const row = div("outline-item" + (this.editor.selection.has(it.id) ? " sel" : ""), (it.kind === "node" ? "▢ " : "— ") + text);
         row.title = it.kind === "node" ? "Click to select, double-click to zoom" : `Link${it.label ? `: ${short(it.label)}` : ""}`;
-        row.addEventListener("click", () => {
+        row.addEventListener("click", (e) => {
+          const now = e.timeStamp || performance.now();
+          if (this.lastTap.id === it.id && now - this.lastTap.t <= 350) {
+            this.lastTap = { id: "", t: 0 };
+            this.editor.zoomToItem(it.id);
+            return;
+          }
+          this.lastTap = { id: it.id, t: now };
           this.editor.selection = new Set([it.id]);
           this.editor.revealItem(it.id);
           this.editor.render();
         });
-        row.addEventListener("dblclick", () => this.editor.zoomToItem(it.id));
         this.list.appendChild(row);
       }
       if (items.length === 0) this.list.appendChild(div("outline-item empty", "(empty)"));

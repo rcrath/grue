@@ -40,53 +40,41 @@ top in that order with working shortcuts (S/Ctrl+N-at-point/L/R), then close #9.
 
 ## Real work — #10 and #11 (layers panel)
 
-These two issues both rewrite the same code (the layer visibility "eye" button in
-`src/ui/panels.ts`'s `LayersPanel`), so they need to be built together, not as two
-separate patches, or one will clobber the other's use of Ctrl-click.
+**Superseded 2026-07-19 (via GitHub issue comments after this doc's first draft):**
+Rich rephrased #10 on the issue itself, dropping the solo/multi toggle-button design
+below entirely. #11's only comment points back at that rephrase, asking whether it
+also cures #11 — so #11 is folded into #10, not a separate feature. Current, final
+design:
 
-### #10 — mutually exclusive layers choice
+### #10 + #11 — Focus Follows Eyeball (final design, revised 2026-07-20)
 
-A new toggle button on the Layers panel switches the eye-button's behavior between
-two modes:
-- **Solo mode**: click a layer's eye → that layer becomes the only visible one, all
-  others hide. Ctrl-click → toggle just that layer, others untouched (escape hatch).
-- **Multi mode** (today's default): click toggles just that layer. Ctrl-click's
-  meaning here is the ambiguous part of the issue text — see open question below.
+**Superseded again 2026-07-20:** Rich posted a further refinement on #10 after the
+2026-07-19 design (below) was built and verified. This is now the true final design;
+the 2026-07-19 version (Ctrl-click = add to selection, Shift-click = select range
+only, no solo) is obsolete and was replaced in code the same day.
 
-Design notes: no data-model change needed — this is a batch write to existing
-per-layer `hidden` flags, wrapped in one `mutate()` call so solo-ing five layers is
-one undo step. The mode toggle itself (solo vs. multi) is proposed as UI-only state
-(not saved in the document, not undoable) — consistent with how the panel already
-treats "which layer is active" as UI state, not document content.
+One interaction model on the Layers panel's eye button, no mode-toggle button, no
+separate "selection" concept — visibility itself carries the meaning:
 
-**Resolved 2026-07-19:** confirmed — Ctrl-click in Multi mode does the same "solo this
-layer" action that plain-click does in Solo mode. Click and Ctrl-click swap meaning
-between the two modes.
+- **Plain click** on a layer's eye → solos that layer: every other layer's eye turns
+  off, this one turns on, and focus (active layer) moves here.
+- **Ctrl-click** → toggles ONLY that layer's visibility (additive if it was off,
+  subtractive if clicked again while on). Does not touch any other layer's
+  visibility and does not touch focus.
+- **Shift-click** → turns visible (additive only) the inclusive range between the
+  current focus layer and this one, by panel display order. Does not touch focus,
+  does not hide anything outside the range.
+- **Confirmed:** focus only ever moves on a plain click. Ctrl-click and Shift-click
+  never change which layer is active, even when a plain click's solo action hides
+  the layer that used to be focused (the newly-clicked layer becomes focus instead).
 
-### #11 — LAYERS: have selection follow visibility
+The "activate a layer" mechanism already exists (`Editor.activateLayer()`); it's wired
+to the eye button's plain-click branch only.
 
-Clicking a layer's eye (to toggle its visibility) also makes that layer the active
-layer — the one new items land on. Ctrl-click toggles visibility only, active layer
-stays put. The "activate a layer" mechanism already exists
-(`Editor.activateLayer()`) — it's just not currently wired to the eye button, only to
-clicking the layer row itself.
-
-**Resolved 2026-07-19:** confirmed as proposed — Ctrl-click never touches active-layer
-state, even when it hides the currently-active layer.
-
-### How #10 and #11 combine
-
-Plain click always activates the clicked layer (regardless of solo/multi mode,
-including a solo-click in Solo mode); Ctrl-click never changes the active layer
-(regardless of mode). That keeps the two features from fighting over the same
-gesture. **Resolved 2026-07-19:** Rich confirmed this combined rule covers both
-issues as proposed — no separate design needed for #11 beyond building #10 with this
-rule baked in.
-
-**Files touched:** `src/ui/panels.ts` (`LayersPanel` — mode-toggle button, eye-button
-click handler rewritten to take the click event and branch on mode + Ctrl key).
-Possibly a small helper in `src/core/model.ts` if you'd rather the solo-batch logic
-live there than inline.
+**Files touched:** `src/ui/panels.ts` (`LayersPanel.onEyeClick` — branches on
+Ctrl/Shift/plain; `refresh()` — dropped the now-unused `selected` UI-state field,
+signature is back to `[doc.layers, doc.activeLayer]`), `src/style.css` (removed the
+now-unused `.layer-row.selected` rules from the 07-19 build).
 
 ---
 

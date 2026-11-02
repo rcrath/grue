@@ -360,7 +360,10 @@ export function importVue(text: string): VueImportResult {
     const w = Math.max(10, parseFloat(el.getAttribute("width") || "60") || 60);
     const h = Math.max(10, parseFloat(el.getAttribute("height") || "24") || 24);
 
-    let shape: NodeShape = "roundRect";
+    // LWText (isText) has no shape/stroke of its own in legacy files; default it
+    // to what the isTextNode heuristic expects (rect, borderless) so it's still
+    // recognized as a text box after import.
+    let shape: NodeShape = isText ? "rect" : "roundRect";
     let shapeEl = directChild(el, "shape");
     if (!shapeEl) {
       const wrap = directChild(el, "nodeShape"); // 2008-era wrapper variant
@@ -368,7 +371,7 @@ export function importVue(text: string): VueImportResult {
     }
     if (shapeEl) {
       const st = (shapeEl.getAttribute("xsi:type") || "").toLowerCase();
-      shape = SHAPE_MAP[st] ?? "roundRect";
+      shape = SHAPE_MAP[st] ?? shape;
     }
 
     const rawLabel = el.getAttribute("label") || "";
@@ -376,7 +379,7 @@ export function importVue(text: string): VueImportResult {
     const stroke = parseVueColor(directChildText(el, "strokeColor")) || "#404040";
     const textColor = parseVueColor(directChildText(el, "textColor")) || "#000000";
     const font = parseVueFont(directChildText(el, "font"), NODE_DEFAULTS.font());
-    const strokeWidth = parseFloat(el.getAttribute("strokeWidth") || "1");
+    const strokeWidth = parseFloat(el.getAttribute("strokeWidth") || (isText ? "0" : "1"));
     const strokeStyle = parseInt(el.getAttribute("strokeStyle") || "0", 10) || 0;
 
     return {

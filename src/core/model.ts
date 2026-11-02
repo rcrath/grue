@@ -216,6 +216,20 @@ export function makeNode(doc: GDoc, x: number, y: number, w: number, h: number, 
   };
 }
 
+/** A "text box" is just a node with fill off, rectangular, borderless — the same
+ *  runtime heuristic legacy VUE used (LWNode.java), not a stored item kind. */
+export function makeTextNode(doc: GDoc, x: number, y: number, w: number, h: number): GNode {
+  const n = makeNode(doc, x, y, w, h, "rect");
+  n.label = "";
+  n.fill = null;
+  n.strokeWidth = 0;
+  return n;
+}
+
+export function isTextNode(it: GItem): it is GNode {
+  return it.kind === "node" && it.shape === "rect" && it.fill === null && it.strokeWidth === 0;
+}
+
 export function makeLink(doc: GDoc, head: LinkEnd, tail: LinkEnd): GLink {
   return {
     kind: "link",
